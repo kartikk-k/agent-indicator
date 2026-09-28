@@ -48,11 +48,16 @@ final class OverlayController {
     private var order: [String] = []
     private var clock: Timer?
     private var presenceCheck: Timer?
+    private var targetFrame = NSRect.zero
+    private var maskRadius: CGFloat = 0
 
-    var corner: Corner = .topRight { didSet { relayout() } }
-    var layout: Layout = .vertical { didSet { relayout() } }
+    private static let resizeDuration: TimeInterval = 0.28
+
+    // Moving to another corner or display jumps; only changes in content animate.
+    var corner: Corner = .topRight { didSet { relayout(animated: false) } }
+    var layout: Layout = .vertical { didSet { relayout(animated: false) } }
     /// The display to sit on; nil means the menu-bar display.
-    var screen: NSScreen? { didSet { relayout() } }
+    var screen: NSScreen? { didSet { relayout(animated: false) } }
     /// Off hides the list entirely (the menu bar icon still shows status).
     var isEnabled = true { didSet { updateVisibility() } }
     var showsElapsedTime = true {
@@ -88,13 +93,12 @@ final class OverlayController {
         background.material = .popover
         background.blendingMode = .behindWindow
         background.state = .active
-        container.autoresizingMask = [.width, .height]
         background.addSubview(container)
         panel.contentView = background
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.relayout() }
+        ) { [weak self] _ in self?.relayout(animated: false) }
 
         // Checked 4× a second so the per-second count never skips; labels only redraw when the text changes.
         clock = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
@@ -103,15 +107,21 @@ final class OverlayController {
 
     func show(_ sessions: [Session], labels: [String: String]) {
         let keys = Set(sessions.map(\.key))
+        let animate = shouldAnimate
         for (key, row) in rows where !keys.contains(key) {
-            row.removeFromSuperview()
             rows[key] = nil
+            guard animate else { row.removeFromSuperview(); continue }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = Self.resizeDuration * 0.6
+                row.animator().alphaValue = 0
+            }, completionHandler: { row.removeFromSuperview() })
         }
         for s in sessions {
             let row = rows[s.key] ?? {
                 let r = RowView(key: s.key, agent: s.agent)
                 r.onClick = { [weak self] key in self?.onClick?(key) }
                 r.showsTime = showsElapsedTime
+                r.frame = .zero                        // marks it as new for the fade-in
                 container.addSubview(r)
                 rows[s.key] = r
                 return r
@@ -159,42 +169,101 @@ final class OverlayController {
         if changed { relayout() }
     }
 
-    private func relayout() {
+    private var shouldAnimate: Bool {
+        panel.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    /// Lays the rows out at their final positions and resizes the window to fit.
+    ///
+    /// When animated, the content is pinned to the chosen corner at its final size, and the
+    /// window edge glides open or closed over it. Rows slide to their new places, new rows fade in.
+    private func relayout(animated: Bool = true) {
         // Fall back to the menu-bar display if the tracked one was unplugged.
         let live = NSScreen.screens.first { $0.number != nil && $0.number == screen?.number }
         guard let screen = live ?? NSScreen.screens.first else { return }
         let list = order.compactMap { rows[$0] }
         let rowHeight = RowView.height
         var width: CGFloat, height: CGFloat
+        var frames: [(RowView, NSRect)] = []
 
         switch layout {
         case .vertical:
             let rowWidth = list.map(\.preferredWidth).max() ?? RowView.minWidth
             for (i, row) in list.enumerated() {
-                row.frame = NSRect(x: inset, y: inset + CGFloat(i) * rowHeight, width: rowWidth, height: rowHeight)
+                frames.append((row, NSRect(x: inset, y: inset + CGFloat(i) * rowHeight, width: rowWidth, height: rowHeight)))
             }
             width = rowWidth + inset * 2
             height = CGFloat(max(1, list.count)) * rowHeight + inset * 2
         case .horizontal:
             var x = inset
             for row in list {
-                row.frame = NSRect(x: x, y: inset, width: row.preferredWidth, height: rowHeight)
+                frames.append((row, NSRect(x: x, y: inset, width: row.preferredWidth, height: rowHeight)))
                 x += row.preferredWidth
             }
             width = max(x, RowView.minWidth + inset) + inset
             height = rowHeight + inset * 2
         }
 
+        let left = corner == .topLeft || corner == .bottomLeft
+        let top = corner == .topLeft || corner == .topRight
         let area = screen.visibleFrame
-        let x = (corner == .topLeft || corner == .bottomLeft) ? area.minX + margin : area.maxX - margin - width
-        let y = (corner == .topLeft || corner == .topRight) ? area.maxY - margin - height : area.minY + margin
-        let frame = NSRect(x: x, y: y, width: width, height: height)
-        guard frame != panel.frame else { return }
-        panel.setFrame(frame, display: true)
-        container.frame = background.bounds
+        let frame = NSRect(x: left ? area.minX + margin : area.maxX - margin - width,
+                           y: top ? area.maxY - margin - height : area.minY + margin,
+                           width: width, height: height)
+        let animate = animated && shouldAnimate
+
+        // The content keeps its final size and sticks to the anchored corner while the window resizes.
+        // Re-pinning moves the container, so remember where rows are on screen and put them back.
+        let onScreen = list.map { $0.frame.isEmpty ? nil : container.convert($0.frame, to: background) }
+        let bounds = background.bounds
+        container.autoresizingMask = [left ? .maxXMargin : .minXMargin, top ? .minYMargin : .maxYMargin]
+        container.frame = NSRect(x: left ? 0 : bounds.width - width,
+                                 y: top ? bounds.height - height : 0,
+                                 width: width, height: height)
+
+        for (row, rect) in onScreen.enumerated().compactMap({ i, r in r.map { (list[i], $0) } }) {
+            row.frame = container.convert(rect, from: background)
+        }
+
+        for (row, rect) in frames {
+            let isNew = row.frame.isEmpty
+            if animate && !isNew {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = Self.resizeDuration
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    row.animator().frame = rect
+                }
+            } else {
+                row.frame = rect
+            }
+            if isNew && animate {
+                row.alphaValue = 0
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = Self.resizeDuration
+                    row.animator().alphaValue = 1
+                }
+            }
+        }
+
+        // The mask stretches (cap insets), so it only needs replacing when the corner radius changes.
         let radius = layout == .horizontal ? height / 2 : 11
-        background.maskImage = .roundedRect(width: width, height: height, radius: radius)
-        panel.invalidateShadow()
+        if radius != maskRadius {
+            maskRadius = radius
+            background.maskImage = .roundedRect(width: radius * 2 + 1, height: radius * 2 + 1, radius: radius)
+        }
+
+        guard frame != targetFrame else { return }
+        targetFrame = frame
+        if animate {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = Self.resizeDuration
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                panel.animator().setFrame(frame, display: true)
+            }, completionHandler: { [weak self] in self?.panel.invalidateShadow() })
+        } else {
+            panel.setFrame(frame, display: true)
+            panel.invalidateShadow()
+        }
     }
 }
 
@@ -329,8 +398,16 @@ private final class RowView: NSView {
     func updateTime(now: Date) -> Bool {
         let value = (showsTime && phase != .done) ? since.map { Self.elapsed(now.timeIntervalSince($0)) } ?? "" : ""
         guard value != time.stringValue else { return false }
+        let appearing = time.stringValue.isEmpty && !value.isEmpty
         time.stringValue = value
         time.isHidden = !timeVisible
+        if appearing && window?.isVisible == true {
+            time.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.3
+                time.animator().alphaValue = 1
+            }
+        }
         needsLayout = true
         return true
     }
