@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let claude = ClaudeSource()
     private let codex = CodexSource()
     private let overlay = OverlayController()
+    private let displays = DisplayTracker()
     private var watcher: FileWatcher?
     private var statusItem: NSStatusItem!
     private var timer: Timer?
@@ -44,19 +45,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { defaults.object(forKey: "removeOnHover") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "removeOnHover") }
     }
+    private func flag(_ key: String, default value: Bool) -> Bool {
+        defaults.object(forKey: key) as? Bool ?? value
+    }
+    private var showList: Bool {
+        get { flag("showList", default: true) }
+        set { defaults.set(newValue, forKey: "showList") }
+    }
+    private var showTime: Bool {
+        get { flag("showTime", default: true) }
+        set { defaults.set(newValue, forKey: "showTime") }
+    }
+    private var followDisplay: Bool {
+        get { flag("followDisplay", default: true) }
+        set { defaults.set(newValue, forKey: "followDisplay") }
+    }
     private func enabled(_ agent: Agent) -> Bool {
         defaults.object(forKey: "show.\(agent.rawValue)") as? Bool ?? true
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "circle.dotted.circle", accessibilityDescription: "Agent Indicator")
+        statusItem.button?.imagePosition = .imageLeading
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
 
         overlay.corner = corner
         overlay.layout = layout
+        overlay.isEnabled = showList
+        overlay.showsElapsedTime = showTime
+        displays.onChange = { [weak self] screen in self?.overlay.screen = screen }
+        if followDisplay { displays.start() }
         overlay.onClick = { [weak self] key in self?.open(key) }
         // Once you've looked at the list and moved away, finished items have done their job.
         overlay.onExit = { [weak self] in
@@ -95,6 +116,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard force || sessions != current else { return }
         current = sessions
         overlay.show(sessions, labels: labelMode.labels(for: sessions))
+        updateStatusItem()
+    }
+
+    /// Menu bar icon: number of working chats, plus an orange dot while one is waiting on you.
+    private func updateStatusItem() {
+        guard let button = statusItem.button else { return }
+        let working = current.filter { $0.phase == .working }.count
+        let waiting = current.contains { $0.phase == .waiting }
+        let title = NSMutableAttributedString()
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        if working > 0 {
+            title.append(NSAttributedString(string: "\(working)", attributes: [.font: font]))
+        }
+        if waiting {
+            title.append(NSAttributedString(string: working > 0 ? " ●" : "●", attributes: [
+                .font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.systemOrange, .baselineOffset: 1.5,
+            ]))
+        }
+        button.attributedTitle = title
+        button.imagePosition = title.length == 0 ? .imageOnly : .imageLeading
+        button.setAccessibilityLabel("Agent Indicator: \(working) working" + (waiting ? ", needs input" : ""))
     }
 
     /// Jump to a session, and clear its checkmark since you've now seen it.
@@ -137,6 +179,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(submenu("Position", position))
 
+        position.addItem(.separator())
+        position.addItem(toggle("Follow Active Display", followDisplay, #selector(toggleFollowDisplay)))
+
         let layouts = NSMenu()
         for l in Layout.allCases {
             let item = NSMenuItem(title: l.title, action: #selector(setLayout(_:)), keyEquivalent: "")
@@ -172,6 +217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         done.addItem(hover)
         menu.addItem(submenu("Show Finished", done))
 
+        menu.addItem(toggle("Show Elapsed Time", showTime, #selector(toggleShowTime)))
+        menu.addItem(toggle("Show Floating List", showList, #selector(toggleShowList)))
+
         let agents = NSMenu()
         for a in Agent.allCases {
             let item = NSMenuItem(title: a.displayName, action: #selector(toggleAgent(_:)), keyEquivalent: "")
@@ -189,6 +237,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Agent Indicator", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    private func toggle(_ title: String, _ on: Bool, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.state = on ? .on : .off
+        item.target = self
+        return item
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
@@ -223,6 +278,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let raw = sender.representedObject as? String, let m = LabelMode(rawValue: raw) else { return }
         labelMode = m
         refresh(fullCodexScan: false, force: true)
+    }
+
+    @objc private func toggleShowTime() {
+        showTime.toggle()
+        overlay.showsElapsedTime = showTime
+    }
+
+    @objc private func toggleShowList() {
+        showList.toggle()
+        overlay.isEnabled = showList
+    }
+
+    @objc private func toggleFollowDisplay() {
+        followDisplay.toggle()
+        if followDisplay {
+            displays.start()
+        } else {
+            displays.stop()
+            overlay.screen = nil
+        }
     }
 
     @objc private func toggleRemoveOnHover() {

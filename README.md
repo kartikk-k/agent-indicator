@@ -8,11 +8,14 @@ When you switch away from your terminal, you lose sight of whether the agent is 
 
 | Row looks like | Meaning |
 | --- | --- |
-| Shimmering text | The agent is working |
-| Orange text | It's waiting for you (permission prompt or question) |
-| Dimmed text | The turn finished |
+| Shimmering text + elapsed time | The agent is working (`30s`, `4m`, `1h 5m`) |
+| Pulsing yellow text | It's waiting for you (permission prompt or question) |
+| Shimmering green text | The turn finished while you were away. It keeps shimmering until you move the mouse or type |
+| Text at 70% opacity | The turn finished |
 
-The list resizes to fit the active chats and disappears when nothing is going on.
+A row flashes when its turn finishes or when it starts waiting on you, so you notice even from the corner of your eye. The list resizes to fit the active chats and disappears when nothing is going on.
+
+The menu bar icon mirrors the list: it shows how many chats are working and an orange dot when one needs you. You can hide the floating list entirely and rely on the menu bar alone.
 
 ## Features
 
@@ -24,6 +27,7 @@ The list resizes to fit the active chats and disappears when nothing is going on
 - **One row per chat.** A new message in the same chat reuses its row, and Codex subagent threads fold into their parent chat.
 - **Short labels.** Each row shows the project folder. When two chats share a folder, the first words of the chat title are added.
 - **Stays out of the way.** It floats above other windows on every Space, including full-screen apps, and never takes focus.
+- **Follows you across displays.** On a multi-monitor setup it moves to the display your pointer is on, or to the one holding the app you just switched to.
 - **Zero setup.** It uses no hooks, needs no config changes, and makes no network requests.
 
 ## Settings
@@ -31,10 +35,13 @@ The list resizes to fit the active chats and disappears when nothing is going on
 Everything lives in the menu bar icon:
 
 - **Position**: top left, top right (default), bottom left or bottom right.
+  - **Follow Active Display** (on by default): move to the display you're working on instead of staying on the menu-bar display.
 - **Layout**: vertical (default) or horizontal.
-- **Labels**: project name (default), chat title, or icons only. Icons Only shows a spinner, orange **!** or green **✓** instead of styled text.
+- **Labels**: project name (default), chat title, or icons only. Icons Only shows a spinner, pulsing **!** or green **✓** instead of styled text.
 - **Show Finished**: how long finished chats stay (don't show, 1, 5 (default), 15 or 60 minutes, or while the session is open).
   - **Remove on Hover** (off by default): clear finished chats when the pointer leaves the list, or when you click them.
+- **Show Elapsed Time** (on by default): how long the current turn has been running. It counts every second for the first minute, then in minutes.
+- **Show Floating List** (on by default): turn off to keep status only in the menu bar.
 - **Agents**: turn Claude and Codex on or off.
 - **Launch at Login**.
 
@@ -88,6 +95,7 @@ Sources/
   CodexSource.swift   Codex rollout tailing + open-file discovery
   Focuser.swift       Click-to-focus (terminal tab / deep link / app)
   FileWatcher.swift   FSEvents wrapper
+  DisplayTracker.swift  Follows the display you're working on
 Resources/Info.plist
 build.sh
 ```

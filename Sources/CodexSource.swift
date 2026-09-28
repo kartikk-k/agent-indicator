@@ -54,10 +54,12 @@ final class CodexSource {
             let top = parts.max { rank($0.state) < rank($1.state) }!
             let main = parts.first { !$0.isSubagent } ?? parts[0]
             let finished = parts.compactMap(\.finishedAt).max()
+            let started = parts.filter { $0.state != .idle }.compactMap(\.turnStartedAt).min()
             let info = SessionInfo(project: main.title, title: threadNames[id], pid: main.pid,
                                    deepLink: URL(string: "codex://threads/\(id)"))
             return RawSession(key: "codex:\(id)", agent: .codex, info: info, state: top.state,
-                              finishedAt: finished, interrupted: top.state == .idle && main.interrupted)
+                              finishedAt: finished, interrupted: top.state == .idle && main.interrupted,
+                              turnStartedAt: started)
         }
     }
 
@@ -125,6 +127,7 @@ final class RolloutFile {
     var pid: pid_t?
     private(set) var state: RawState = .idle
     private(set) var finishedAt: Date?
+    private(set) var turnStartedAt: Date?
     private(set) var interrupted = false
     private var offset: UInt64 = 0
     private var partial = Data()
@@ -206,6 +209,7 @@ final class RolloutFile {
         switch type {
         case "task_started", "turn_started":
             state = .working; interrupted = false; finishedAt = nil
+            turnStartedAt = (obj["timestamp"] as? String).flatMap(Self.iso.date(from:)) ?? Date()
         case "task_complete", "turn_complete":
             state = .idle; interrupted = false
             finishedAt = (obj["timestamp"] as? String).flatMap(Self.iso.date(from:)) ?? Date()

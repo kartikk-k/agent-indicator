@@ -57,10 +57,14 @@ final class ClaudeSource {
                 title = aiTitle(sessionID: sid, cwd: cwd)
             }
 
+            // statusUpdatedAt is when it last became busy; a close enough turn start for a fresh launch.
+            let turnStartedAt = state == .idle ? nil
+                : (obj["statusUpdatedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
+
             let info = SessionInfo(project: URL(fileURLWithPath: cwd).lastPathComponent,
                                    title: title, pid: pid, deepLink: nil)
             out.append(RawSession(key: "claude:\(pid)", agent: .claude, info: info,
-                                  state: state, finishedAt: finishedAt))
+                                  state: state, finishedAt: finishedAt, turnStartedAt: turnStartedAt))
         }
         return out
     }

@@ -35,6 +35,8 @@ struct RawSession {
     let finishedAt: Date?
     /// The last turn was cancelled by the user rather than completing.
     var interrupted = false
+    /// For sessions seen for the first time mid-turn: when the turn started, if known.
+    var turnStartedAt: Date? = nil
 }
 
 enum Phase: Equatable {
@@ -46,12 +48,15 @@ struct Session: Equatable {
     let agent: Agent
     let info: SessionInfo
     let phase: Phase
+    /// When the current turn started (working or waiting), for the elapsed-time label.
+    let since: Date?
 }
 
 /// Turns raw source state into what the overlay shows, remembering when turns finished.
 final class SessionStore {
     private var lastState: [String: RawState] = [:]
     private var doneAt: [String: Date] = [:]
+    private var turnStart: [String: Date] = [:]
     private var firstSeen: [String: Int] = [:]
     private var counter = 0
 
@@ -76,7 +81,12 @@ final class SessionStore {
             switch r.state {
             case .working, .waiting:
                 doneAt[r.key] = nil
+                if turnStart[r.key] == nil {
+                    // Waiting for a permission is part of the same turn, so the clock keeps running.
+                    turnStart[r.key] = previous == nil ? (r.turnStartedAt ?? now) : now
+                }
             case .idle:
+                turnStart[r.key] = nil
                 if r.interrupted {
                     doneAt[r.key] = nil
                 } else if let previous, previous != .idle {
@@ -95,11 +105,12 @@ final class SessionStore {
                 if let window, now.timeIntervalSince(d) > window { continue }
                 phase = .done
             }
-            out.append(Session(key: r.key, agent: r.agent, info: r.info, phase: phase))
+            out.append(Session(key: r.key, agent: r.agent, info: r.info, phase: phase,
+                               since: phase == .done ? nil : turnStart[r.key]))
         }
 
         for key in Array(lastState.keys) where !live.contains(key) {
-            lastState[key] = nil; doneAt[key] = nil; firstSeen[key] = nil
+            lastState[key] = nil; doneAt[key] = nil; firstSeen[key] = nil; turnStart[key] = nil
         }
 
         // Stable order: by agent, then by when we first saw the session. Nothing jumps around.
