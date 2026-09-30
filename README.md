@@ -8,7 +8,7 @@ When you switch away from your terminal, you lose sight of whether the agent is 
 
 | Row looks like | Meaning |
 | --- | --- |
-| Shimmering text + elapsed time | The agent is working (`30s`, `4m`, `1h 5m`) |
+| Blue text with a white shimmer + elapsed time | The agent is working (`30s`, `4m`, `1h 5m`) |
 | Pulsing yellow text | It's waiting for you (permission prompt or question) |
 | Shimmering green text | The turn finished while you were away. It keeps shimmering until you move the mouse or type |
 | Text at 70% opacity | The turn finished |
@@ -34,7 +34,7 @@ The menu bar icon mirrors the list: it shows how many chats are working and an o
 
 Everything lives in the menu bar icon:
 
-- **Position**: top left, top right (default), bottom left or bottom right.
+- **Position**: any corner (top right by default) or the middle of any edge. You can also drag the list anywhere, and it snaps to the nearest of these 8 positions when you let go.
   - **Follow Active Display** (on by default): move to the display you're working on instead of staying on the menu-bar display.
 - **Layout**: vertical (default) or horizontal.
 - **Labels**: project name (default), chat title, or icons only. Icons Only shows a spinner, pulsing **!** or green **✓** instead of styled text.
@@ -49,7 +49,11 @@ The menu also lists every session with its full project name and chat title. Cli
 
 ## Install
 
-Requires macOS 13 or later and the Xcode Command Line Tools (`xcode-select --install`). Full Xcode isn't needed.
+Download `Agent Indicator.dmg` from the [latest release](https://github.com/kartikk-k/agent-indicator/releases/latest), open it, and drag **Agent Indicator** to Applications. It's signed with a Developer ID and notarized by Apple, and runs on Apple Silicon and Intel Macs with macOS 13 or later.
+
+### Build from source
+
+Requires the Xcode Command Line Tools (`xcode-select --install`). Full Xcode isn't needed.
 
 ```sh
 git clone https://github.com/kartikk-k/agent-indicator.git
@@ -59,6 +63,12 @@ open "build/Agent Indicator.app"
 ```
 
 To keep it around, move `build/Agent Indicator.app` to `/Applications` and turn on **Launch at Login** from the menu.
+
+To make a signed, notarized DMG yourself, you need a Developer ID Application certificate and a `notarytool` keychain profile (`xcrun notarytool store-credentials`):
+
+```sh
+NOTARY_PROFILE=<your-profile> ./release.sh    # → build/Agent Indicator.dmg
+```
 
 The first time you click a Terminal or iTerm2 session, macOS asks for permission to control that terminal. That permission is only used to select the right tab. The app is ad-hoc signed, so macOS may ask again after a rebuild.
 
@@ -97,5 +107,7 @@ Sources/
   FileWatcher.swift   FSEvents wrapper
   DisplayTracker.swift  Follows the display you're working on
 Resources/Info.plist
-build.sh
+Resources/AgentIndicator.entitlements
+build.sh              Local ad-hoc build
+release.sh            Universal, signed, notarized DMG
 ```

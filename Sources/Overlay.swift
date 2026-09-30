@@ -1,17 +1,67 @@
 import AppKit
 import QuartzCore
 
-enum Corner: String, CaseIterable {
-    case topLeft, topRight, bottomLeft, bottomRight
+/// Where the list sits: the four corners and the middle of each edge.
+enum Anchor: String, CaseIterable {
+    case topLeft, topCenter, topRight, middleLeft, middleRight, bottomLeft, bottomCenter, bottomRight
 
     var title: String {
         switch self {
         case .topLeft: return "Top Left"
+        case .topCenter: return "Top Center"
         case .topRight: return "Top Right"
+        case .middleLeft: return "Middle Left"
+        case .middleRight: return "Middle Right"
         case .bottomLeft: return "Bottom Left"
+        case .bottomCenter: return "Bottom Center"
         case .bottomRight: return "Bottom Right"
         }
     }
+
+    enum Edge { case start, center, end }
+
+    var horizontal: Edge {
+        switch self {
+        case .topLeft, .middleLeft, .bottomLeft: return .start
+        case .topCenter, .bottomCenter: return .center
+        case .topRight, .middleRight, .bottomRight: return .end
+        }
+    }
+
+    /// .start is the top.
+    var vertical: Edge {
+        switch self {
+        case .topLeft, .topCenter, .topRight: return .start
+        case .middleLeft, .middleRight: return .center
+        case .bottomLeft, .bottomCenter, .bottomRight: return .end
+        }
+    }
+
+    /// The list's frame at this anchor, for a list of `size` on a display's usable area.
+    func frame(size: NSSize, in area: NSRect, margin: CGFloat) -> NSRect {
+        let x: CGFloat
+        switch horizontal {
+        case .start: x = area.minX + margin
+        case .center: x = area.midX - size.width / 2
+        case .end: x = area.maxX - margin - size.width
+        }
+        let y: CGFloat
+        switch vertical {
+        case .start: y = area.maxY - margin - size.height
+        case .center: y = area.midY - size.height / 2
+        case .end: y = area.minY + margin
+        }
+        return NSRect(origin: NSPoint(x: x, y: y), size: size).integral
+    }
+}
+
+/// Mouse handling shared by rows and the list's padding: a press that moves more than a few
+/// points becomes a drag of the whole list; otherwise it's a click.
+struct PressHandlers {
+    var began: () -> Void = {}
+    var moved: () -> Void = {}
+    /// Returns true if the press was a drag (so it shouldn't count as a click).
+    var ended: () -> Bool = { false }
 }
 
 enum Layout: String, CaseIterable {
@@ -28,6 +78,12 @@ private final class OverlayPanel: NSPanel {
 private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
     var onExit: (() -> Void)?
+    var press = PressHandlers()
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { press.began() }
+    override func mouseDragged(with event: NSEvent) { press.moved() }
+    override func mouseUp(with event: NSEvent) { _ = press.ended() }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -50,14 +106,20 @@ final class OverlayController {
     private var presenceCheck: Timer?
     private var targetFrame = NSRect.zero
     private var maskRadius: CGFloat = 0
+    private var dragStart: (mouse: NSPoint, origin: NSPoint)?
+    private var isDragging = false
+    private var snapping = false
 
     private static let resizeDuration: TimeInterval = 0.28
+    private static let dragThreshold: CGFloat = 4
 
-    // Moving to another corner or display jumps; only changes in content animate.
-    var corner: Corner = .topRight { didSet { relayout(animated: false) } }
+    // Picking a position from the menu or changing display jumps; content changes and snaps animate.
+    var anchor: Anchor = .topRight { didSet { if !snapping { relayout(animated: false) } } }
     var layout: Layout = .vertical { didSet { relayout(animated: false) } }
     /// The display to sit on; nil means the menu-bar display.
-    var screen: NSScreen? { didSet { relayout(animated: false) } }
+    var screen: NSScreen? { didSet { if !snapping { relayout(animated: false) } } }
+    /// The list was dragged and snapped to a new position.
+    var onAnchorChange: ((Anchor) -> Void)?
     /// Off hides the list entirely (the menu bar icon still shows status).
     var isEnabled = true { didSet { updateVisibility() } }
     var showsElapsedTime = true {
@@ -95,6 +157,7 @@ final class OverlayController {
         background.state = .active
         background.addSubview(container)
         panel.contentView = background
+        container.press = pressHandlers
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -120,6 +183,7 @@ final class OverlayController {
             let row = rows[s.key] ?? {
                 let r = RowView(key: s.key, agent: s.agent)
                 r.onClick = { [weak self] key in self?.onClick?(key) }
+                r.press = pressHandlers
                 r.showsTime = showsElapsedTime
                 r.frame = .zero                        // marks it as new for the fade-in
                 container.addSubview(r)
@@ -169,6 +233,60 @@ final class OverlayController {
         if changed { relayout() }
     }
 
+    // MARK: Dragging
+
+    private var pressHandlers: PressHandlers {
+        PressHandlers(
+            began: { [weak self] in self?.pressBegan() },
+            moved: { [weak self] in self?.pressMoved() },
+            ended: { [weak self] in self?.pressEnded() ?? false })
+    }
+
+    private func pressBegan() {
+        dragStart = (NSEvent.mouseLocation, panel.frame.origin)
+        isDragging = false
+    }
+
+    private func pressMoved() {
+        guard let start = dragStart else { return }
+        let mouse = NSEvent.mouseLocation
+        let dx = mouse.x - start.mouse.x, dy = mouse.y - start.mouse.y
+        if !isDragging {
+            guard hypot(dx, dy) > Self.dragThreshold else { return }
+            isDragging = true
+        }
+        panel.setFrameOrigin(NSPoint(x: start.origin.x + dx, y: start.origin.y + dy))
+    }
+
+    private func pressEnded() -> Bool {
+        defer { dragStart = nil; isDragging = false }
+        guard isDragging else { return false }
+        isDragging = false
+        snapToNearestAnchor()
+        return true
+    }
+
+    /// Drop point → the closest of the eight positions on the display under the pointer.
+    private func snapToNearestAnchor() {
+        let mouse = NSEvent.mouseLocation
+        let target = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? panel.screen ?? NSScreen.screens[0]
+        let current = panel.frame
+        let center = NSPoint(x: current.midX, y: current.midY)
+        let best = Anchor.allCases.min { a, b in
+            let fa = a.frame(size: current.size, in: target.visibleFrame, margin: margin)
+            let fb = b.frame(size: current.size, in: target.visibleFrame, margin: margin)
+            return hypot(fa.midX - center.x, fa.midY - center.y) < hypot(fb.midX - center.x, fb.midY - center.y)
+        } ?? anchor
+
+        snapping = true
+        anchor = best
+        screen = target
+        snapping = false
+        targetFrame = .zero            // force the move even if it lands back where it started
+        relayout(animated: true)
+        onAnchorChange?(best)
+    }
+
     private var shouldAnimate: Bool {
         panel.isVisible && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     }
@@ -178,6 +296,7 @@ final class OverlayController {
     /// When animated, the content is pinned to the chosen corner at its final size, and the
     /// window edge glides open or closed over it. Rows slide to their new places, new rows fade in.
     private func relayout(animated: Bool = true) {
+        guard !isDragging else { return }      // the snap at the end of the drag lays out again
         // Fall back to the menu-bar display if the tracked one was unplugged.
         let live = NSScreen.screens.first { $0.number != nil && $0.number == screen?.number }
         guard let screen = live ?? NSScreen.screens.first else { return }
@@ -204,22 +323,27 @@ final class OverlayController {
             height = rowHeight + inset * 2
         }
 
-        let left = corner == .topLeft || corner == .bottomLeft
-        let top = corner == .topLeft || corner == .topRight
-        let area = screen.visibleFrame
-        let frame = NSRect(x: left ? area.minX + margin : area.maxX - margin - width,
-                           y: top ? area.maxY - margin - height : area.minY + margin,
-                           width: width, height: height)
+        let frame = anchor.frame(size: NSSize(width: width, height: height), in: screen.visibleFrame, margin: margin)
         let animate = animated && shouldAnimate
 
-        // The content keeps its final size and sticks to the anchored corner while the window resizes.
-        // Re-pinning moves the container, so remember where rows are on screen and put them back.
+        // The content keeps its final size and sticks to the anchored side (or stays centred) while
+        // the window resizes. Re-pinning moves the container, so remember where rows are on screen.
         let onScreen = list.map { $0.frame.isEmpty ? nil : container.convert($0.frame, to: background) }
         let bounds = background.bounds
-        container.autoresizingMask = [left ? .maxXMargin : .minXMargin, top ? .minYMargin : .maxYMargin]
-        container.frame = NSRect(x: left ? 0 : bounds.width - width,
-                                 y: top ? bounds.height - height : 0,
-                                 width: width, height: height)
+        var mask: NSView.AutoresizingMask = []
+        let x: CGFloat, y: CGFloat
+        switch anchor.horizontal {
+        case .start: x = 0; mask.insert(.maxXMargin)
+        case .center: x = (bounds.width - width) / 2; mask.formUnion([.minXMargin, .maxXMargin])
+        case .end: x = bounds.width - width; mask.insert(.minXMargin)
+        }
+        switch anchor.vertical {                  // background isn't flipped: top = high y
+        case .start: y = bounds.height - height; mask.insert(.minYMargin)
+        case .center: y = (bounds.height - height) / 2; mask.formUnion([.minYMargin, .maxYMargin])
+        case .end: y = 0; mask.insert(.maxYMargin)
+        }
+        container.autoresizingMask = mask
+        container.frame = NSRect(x: x, y: y, width: width, height: height)
 
         for (row, rect) in onScreen.enumerated().compactMap({ i, r in r.map { (list[i], $0) } }) {
             row.frame = container.convert(rect, from: background)
@@ -269,22 +393,29 @@ final class OverlayController {
 
 // MARK: - One session: logo + label (or a status icon when labels are off)
 
-/// With a label: working text shimmers, waiting text pulses in yellow, finished text is dimmed.
+/// With a label: working text is blue with a white shimmer, waiting text pulses in yellow,
+/// finished text is dimmed.
 /// Without one (Icons Only): a spinner, "!" or check next to the logo.
 /// A row flashes once when its turn finishes or it starts waiting on you.
 private final class RowView: NSView {
     static let height: CGFloat = 24
     static let minWidth: CGFloat = 6 + 16 + 5 + 13 + 6
     private static let maxLabelWidth: CGFloat = 150
-    private static let restingAlpha: CGFloat = 0.7   // finished text, and the shimmer's dim base
+    private static let restingAlpha: CGFloat = 0.7   // finished text
 
     /// Yellow reads well on the dark material; on the light one it needs to be orange to be legible.
     static let attention = NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .systemYellow : .systemOrange
     }
 
+    /// In progress: #0088F5.
+    static let active = NSColor(srgbRed: 0, green: 0x88 / 255.0, blue: 0xF5 / 255.0, alpha: 1)
+    /// Strength of the white highlight that sweeps across shimmering text.
+    private static let highlightAlpha: CGFloat = 0.6
+
     let key: String
     var onClick: ((String) -> Void)?
+    var press = PressHandlers()
     var phase: Phase = .done {
         didSet {
             guard phase != oldValue else { return }
@@ -301,6 +432,7 @@ private final class RowView: NSView {
         didSet {
             guard label != oldValue else { return }
             text.stringValue = label ?? ""
+            highlight.stringValue = label ?? ""
             render()
             needsLayout = true
         }
@@ -309,7 +441,9 @@ private final class RowView: NSView {
     var showsTime = true { didSet { if showsTime != oldValue { _ = updateTime(now: Date()) } } }
 
     private let logo = NSImageView()
-    private let textHost = NSView()           // masked by the shimmer gradient, pulsed when waiting
+    private let textHost = NSView()           // pulsed when waiting
+    private let highlightHost = NSView()      // white copy of the label, masked to the moving band
+    private let highlight = NSTextField(labelWithString: "")
     private let text = NSTextField(labelWithString: "")
     private let time = NSTextField(labelWithString: "")
     private let shimmer = CAGradientLayer()
@@ -348,6 +482,13 @@ private final class RowView: NSView {
         text.lineBreakMode = .byTruncatingTail
         textHost.wantsLayer = true
         textHost.addSubview(text)
+        highlight.font = text.font
+        highlight.lineBreakMode = .byTruncatingTail
+        highlight.textColor = NSColor.white.withAlphaComponent(Self.highlightAlpha)
+        highlightHost.wantsLayer = true
+        highlightHost.isHidden = true
+        highlightHost.addSubview(highlight)
+        textHost.addSubview(highlightHost)
         time.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         time.textColor = .secondaryLabelColor
         time.alignment = .right
@@ -355,8 +496,9 @@ private final class RowView: NSView {
         badge.wantsLayer = true
 
         // A bright band sweeping left to right over text at the resting opacity.
-        let dim = CGColor(gray: 0, alpha: Self.restingAlpha), full = CGColor(gray: 0, alpha: 1)
-        shimmer.colors = [dim, full, dim]
+        // Mask for the white copy: transparent everywhere except a soft band.
+        let clear = CGColor(gray: 0, alpha: 0), band = CGColor(gray: 0, alpha: 1)
+        shimmer.colors = [clear, band, clear]
         shimmer.startPoint = CGPoint(x: 0, y: 0.5)
         shimmer.endPoint = CGPoint(x: 1, y: 0.5)
         shimmer.locations = [0, 0.15, 0.3]
@@ -386,10 +528,12 @@ private final class RowView: NSView {
         let textHeight = ceil(text.intrinsicContentSize.height)
         textHost.frame = NSRect(x: 28, y: midY - textHeight / 2, width: max(0, textRight - 28), height: textHeight)
         text.frame = textHost.bounds
+        highlightHost.frame = textHost.bounds
+        highlight.frame = highlightHost.bounds
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        shimmer.frame = textHost.bounds
+        shimmer.frame = highlightHost.bounds
         glow.frame = bounds
         CATransaction.commit()
     }
@@ -429,7 +573,7 @@ private final class RowView: NSView {
 
         if labelled {
             switch phase {
-            case .working: text.textColor = .labelColor
+            case .working: text.textColor = Self.active          // blue shimmer = in progress
             case .waiting: text.textColor = Self.attention
             case .done: text.textColor = unseen ? .systemGreen : NSColor.labelColor.withAlphaComponent(Self.restingAlpha)
             }
@@ -448,8 +592,10 @@ private final class RowView: NSView {
         }
     }
 
+    /// A white highlight sweeping over the (fully opaque) coloured text.
     private func setShimmering(_ on: Bool) {
-        guard let host = textHost.layer else { return }
+        guard let host = highlightHost.layer else { return }
+        highlightHost.isHidden = !on
         if !on {
             host.mask = nil
             shimmer.removeAllAnimations()
@@ -497,9 +643,11 @@ private final class RowView: NSView {
 
     // Clicks land even though the panel never becomes key.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) {}
+    override func mouseDown(with event: NSEvent) { press.began() }
+    override func mouseDragged(with event: NSEvent) { press.moved() }
     override func mouseUp(with event: NSEvent) {
-        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?(key) }
+        let wasDrag = press.ended()
+        if !wasDrag, bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?(key) }
     }
 
     override func updateTrackingAreas() {
@@ -555,7 +703,7 @@ private final class SpinnerView: NSView {
 
     private func updateColor() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            arc.strokeColor = NSColor.labelColor.withAlphaComponent(0.75).cgColor
+            arc.strokeColor = RowView.active.cgColor
         }
     }
 

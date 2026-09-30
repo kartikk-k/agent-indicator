@@ -21,8 +21,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ("1 Hour", 3600), ("While Session Is Open", nil),
     ]
 
-    private var corner: Corner {
-        get { Corner(rawValue: defaults.string(forKey: "corner") ?? "") ?? .topRight }
+    private var anchor: Anchor {
+        get { Anchor(rawValue: defaults.string(forKey: "corner") ?? "") ?? .topRight }
         set { defaults.set(newValue.rawValue, forKey: "corner") }
     }
     private var layout: Layout {
@@ -72,7 +72,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
-        overlay.corner = corner
+        overlay.anchor = anchor
+        overlay.onAnchorChange = { [weak self] anchor in self?.anchor = anchor }
         overlay.layout = layout
         overlay.isEnabled = showList
         overlay.showsElapsedTime = showTime
@@ -170,10 +171,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let position = NSMenu()
-        for c in Corner.allCases {
-            let item = NSMenuItem(title: c.title, action: #selector(setCorner(_:)), keyEquivalent: "")
-            item.representedObject = c.rawValue
-            item.state = c == corner ? .on : .off
+        for (i, a) in Anchor.allCases.enumerated() {
+            if i == 3 || i == 5 { position.addItem(.separator()) }   // top · middle · bottom
+            let item = NSMenuItem(title: a.title, action: #selector(setAnchor(_:)), keyEquivalent: "")
+            item.representedObject = a.rawValue
+            item.state = a == anchor ? .on : .off
             item.target = self
             position.addItem(item)
         }
@@ -181,6 +183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         position.addItem(.separator())
         position.addItem(toggle("Follow Active Display", followDisplay, #selector(toggleFollowDisplay)))
+        position.addItem(disabled("Tip: drag the list to move it"))
 
         let layouts = NSMenu()
         for l in Layout.allCases {
@@ -258,10 +261,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
-    @objc private func setCorner(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let c = Corner(rawValue: raw) else { return }
-        corner = c
-        overlay.corner = c
+    @objc private func setAnchor(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let a = Anchor(rawValue: raw) else { return }
+        anchor = a
+        overlay.anchor = a
     }
 
     @objc private func setLayout(_ sender: NSMenuItem) {
