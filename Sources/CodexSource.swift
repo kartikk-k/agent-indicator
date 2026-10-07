@@ -20,6 +20,12 @@ final class CodexSource {
         indexPath = base.appendingPathComponent("session_index.jsonl").path
     }
 
+    func reload() {
+        files.removeAll()
+        threadNames.removeAll()
+        indexMTime = nil
+    }
+
     /// Re-read the files FSEvents reported as changed. Returns false if one of them is a
     /// rollout we aren't tracking yet (a new session), so the caller should run discovery.
     func filesChanged(_ paths: [String]) -> Bool {
@@ -46,20 +52,36 @@ final class CodexSource {
             loadThreadNames()
         }
 
-        // One item per chat: subagent threads and continuation files share the chat's
-        // session_id, so fold them together. Working beats waiting beats idle.
-        let chats = Dictionary(grouping: files.values) { $0.sessionID ?? $0.path }
+        return Self.merge(Array(files.values), threadNames: threadNames)
+    }
+
+    /// Continuations describe successive versions of one conversation, not competing
+    /// statuses. The newest main-thread lifecycle event wins, including completion.
+    static func merge(_ files: [RolloutFile], threadNames: [String: String] = [:], now: Date = Date()) -> [RawSession] {
+        let chats = Dictionary(grouping: files) { $0.sessionID ?? $0.path }
         return chats.map { id, parts in
-            let rank: (RawState) -> Int = { $0 == .working ? 2 : $0 == .waiting ? 1 : 0 }
-            let top = parts.max { rank($0.state) < rank($1.state) }!
-            let main = parts.first { !$0.isSubagent } ?? parts[0]
-            let finished = parts.compactMap(\.finishedAt).max()
-            let started = parts.filter { $0.state != .idle }.compactMap(\.turnStartedAt).min()
+            let mains = parts.filter { !$0.isSubagent }
+            let candidates = mains.isEmpty ? parts : mains
+            let main = candidates.max {
+                let a = $0.stateChangedAt ?? .distantPast, b = $1.stateChangedAt ?? .distantPast
+                return a == b ? $0.path < $1.path : a < b
+            }!
+            // Only activity belonging to the selected turn can keep it alive.
+            let currentParts = parts.filter {
+                $0 === main || (main.turnID != nil && $0.turnID == main.turnID)
+            }
+            let evidence = currentParts.compactMap(\.lastEvidenceAt).max()
+            let state = SessionEvidence.state(main.state, lastActivity: evidence, now: now)
+            let latest = currentParts.max { ($0.activityAt ?? .distantPast) < ($1.activityAt ?? .distantPast) }
+            let horizon = now.addingTimeInterval(-Activity.traceWindow)
+            let beats = currentParts.flatMap(\.beats).filter { $0 > horizon }.sorted()
+            let activity = state == .unknown ? "No recent activity · status unconfirmed"
+                : state == .waiting ? "Needs your input" : latest?.activity
             let info = SessionInfo(project: main.title, title: threadNames[id], pid: main.pid,
                                    deepLink: URL(string: "codex://threads/\(id)"))
-            return RawSession(key: "codex:\(id)", agent: .codex, info: info, state: top.state,
-                              finishedAt: finished, interrupted: top.state == .idle && main.interrupted,
-                              turnStartedAt: started)
+            return RawSession(key: "codex:\(id)", agent: .codex, info: info, state: state,
+                              finishedAt: main.finishedAt, interrupted: main.interrupted,
+                              turnStartedAt: main.turnStartedAt, activity: activity, beats: beats, turnID: main.turnID)
         }
     }
 
@@ -128,99 +150,206 @@ final class RolloutFile {
     private(set) var state: RawState = .idle
     private(set) var finishedAt: Date?
     private(set) var turnStartedAt: Date?
+    private(set) var activity: String?
+    private(set) var activityAt: Date?
+    private(set) var beats: [Date] = []
     private(set) var interrupted = false
+    private(set) var stateChangedAt: Date?
+    private(set) var lastEvidenceAt: Date?
+    private(set) var turnID: String?
+    private var fileIdentity: UInt64?
+    private var fileModifiedAt: Date?
     private var offset: UInt64 = 0
     private var partial = Data()
 
     private static let marker = Data("event_msg".utf8)
-    private static let iso: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-
     init(path: String) {
         self.path = path
+        load()
+    }
+
+    private func load() {
+        title = "Codex"; sessionID = nil; isSubagent = false
+        state = .idle; finishedAt = nil; turnStartedAt = nil; turnID = nil
+        stateChangedAt = nil; lastEvidenceAt = nil; activity = nil; activityAt = nil
+        beats.removeAll(); interrupted = false; offset = 0; partial.removeAll()
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        fileIdentity = attrs?[.systemFileNumber] as? UInt64
+        fileModifiedAt = attrs?[.modificationDate] as? Date
         guard let h = FileHandle(forReadingAtPath: path) else { return }
         defer { try? h.close() }
 
-        // session_meta at the top of the file: chat id, working directory (title), thread kind.
+        // Parse actual JSON so whitespace, escaping and nested metadata cannot change identity.
         if let head = try? h.read(upToCount: 64 * 1024),
-           let s = String(data: head, encoding: .utf8) {
-            func field(_ name: String) -> String? {
-                guard let r = s.range(of: "\"\(name)\":\""),
-                      let end = s[r.upperBound...].firstIndex(of: "\"") else { return nil }
-                return String(s[r.upperBound..<end])
-            }
-            sessionID = field("session_id") ?? field("id")
-            isSubagent = field("thread_source") == "subagent"
-            if let cwd = field("cwd") { title = URL(fileURLWithPath: cwd).lastPathComponent }
+           let line = head.split(separator: 0x0A).first,
+           let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+           obj["type"] as? String == "session_meta", let meta = obj["payload"] as? [String: Any] {
+            sessionID = meta["session_id"] as? String ?? meta["id"] as? String
+            isSubagent = meta["thread_source"] as? String == "subagent"
+                || (meta["source"] as? [String: Any])?["subagent"] != nil
+            if let cwd = meta["cwd"] as? String { title = URL(fileURLWithPath: cwd).lastPathComponent }
         }
 
-        // Initial state: scan the tail for the most recent turn event.
         let size = (try? h.seekToEnd()) ?? 0
         let start = size > 4_000_000 ? size - 4_000_000 : 0
         try? h.seek(toOffset: start)
         var tail = (try? h.readToEnd()) ?? Data()
-        if start > 0, let nl = tail.firstIndex(of: 0x0A) { tail = tail[(nl + 1)...] }
-        offset = size
-
-        var sawTurnEvent = false
-        for line in tail.split(separator: 0x0A) where apply(Data(line)) { sawTurnEvent = true }
-        if !sawTurnEvent {
-            // A very long turn may have pushed task_started out of the tail window.
-            let mtime = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date) ?? .distantPast
-            state = Date().timeIntervalSince(mtime) < 30 ? .working : .idle
+        offset = start + UInt64(tail.count)
+        if start > 0 {
+            if let nl = tail.firstIndex(of: 0x0A) { tail = Data(tail[(nl + 1)...]) }
+            else { tail.removeAll() }
         }
+        consume(tail)
+        // A truncated history or a log mtime alone cannot prove that a task is running.
+        if stateChangedAt == nil, start > 0 || lastEvidenceAt != nil { state = .unknown }
     }
 
     func readNew() {
-        guard let h = FileHandle(forReadingAtPath: path) else { return }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        let identity = attrs?[.systemFileNumber] as? UInt64
+        let size = attrs?[.size] as? UInt64 ?? 0
+        let modifiedAt = attrs?[.modificationDate] as? Date
+        if identity != fileIdentity || size < offset || (size == offset && modifiedAt != fileModifiedAt) { load(); return }
+        fileModifiedAt = modifiedAt
+        guard size > offset, let h = FileHandle(forReadingAtPath: path) else { return }
         defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        if size < offset { offset = 0; partial.removeAll() }   // truncated / replaced
-        guard size > offset else { return }
         try? h.seek(toOffset: offset)
         guard let chunk = try? h.readToEnd() else { return }
         offset += UInt64(chunk.count)
+        consume(chunk)
+    }
 
+    private func consume(_ chunk: Data) {
         partial.append(chunk)
         guard let lastNL = partial.lastIndex(of: 0x0A) else { return }
         let complete = partial[partial.startIndex..<lastNL]
         partial = Data(partial[(lastNL + 1)...])
-
-        for line in complete.split(separator: 0x0A) {
-            if !apply(Data(line)), state == .waiting {
-                state = .working  // anything else happening means the approval was answered
-            }
-        }
+        for line in complete.split(separator: 0x0A) { apply(Data(line)) }
     }
 
     /// Returns true if the line was a turn-level event that set the state.
-    @discardableResult
-    private func apply(_ line: Data) -> Bool {
-        guard line.count < 512 * 1024, line.range(of: Self.marker) != nil,
+    private static let activityMarkers = ["\"function_call\"", "\"custom_tool_call\"", "\"local_shell_call\"",
+                                          "\"reasoning\"", "\"message\"", "\"web_search_call\""].map { Data($0.utf8) }
+
+    /// Tool calls, reasoning and replies → the "doing now" line and the activity trace.
+    private func noteActivity(_ line: Data) {
+        // The payload type sits near the start of the line; check it before parsing big lines.
+        let head = line.prefix(400)
+        guard head.range(of: Data("response_item".utf8)) != nil,
+              Self.activityMarkers.contains(where: { head.range(of: $0) != nil }),
+              line.count < 4_000_000,
               let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              obj["type"] as? String == "event_msg",
-              let payload = obj["payload"] as? [String: Any],
-              let type = payload["type"] as? String
-        else { return false }
+              let payload = obj["payload"] as? [String: Any], let type = payload["type"] as? String else { return }
+        guard let date = EventDate.parse(obj["timestamp"] as? String) else { return }
 
         switch type {
+        case "function_call", "custom_tool_call", "local_shell_call":
+            let name = payload["name"] as? String ?? "shell"
+            let input = payload["input"] as? String ?? payload["arguments"] as? String
+                ?? (payload["action"].map { "\($0)" } ?? "")
+            activity = Activity.codexCall(name: name, input: String(input.prefix(4000)))
+            beats.append(date)
+        case "web_search_call":
+            activity = "Searching the web"
+            beats.append(date)
+        case "reasoning":
+            activity = "Thinking"
+        case "message" where payload["role"] as? String == "assistant":
+            activity = "Writing a reply"
+        default:
+            return
+        }
+        activityAt = date
+        let horizon = Date().addingTimeInterval(-Activity.traceWindow)
+        if let first = beats.first, first < horizon { beats.removeAll { $0 < horizon } }
+    }
+
+    @discardableResult
+    private func apply(_ line: Data) -> Bool {
+        noteActivity(line)
+        // Completion events may include a very large final answer. Never discard them
+        // because of the answer's length (the old 512 KB cap left turns working forever).
+        guard line.range(of: Self.marker) != nil || line.range(of: Data("response_item".utf8)) != nil
+                || line.range(of: Data("session_meta".utf8)) != nil,
+              let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let payload = obj["payload"] as? [String: Any] else { return false }
+        if obj["type"] as? String == "session_meta" {
+            sessionID = payload["session_id"] as? String ?? payload["id"] as? String
+            isSubagent = payload["thread_source"] as? String == "subagent"
+                || (payload["source"] as? [String: Any])?["subagent"] != nil
+            if let cwd = payload["cwd"] as? String { title = URL(fileURLWithPath: cwd).lastPathComponent }
+            return false
+        }
+        guard let type = payload["type"] as? String else { return false }
+        let date = EventDate.parse(obj["timestamp"] as? String)
+        let eventTurn = payload["turn_id"] as? String
+        let matchesTurn = eventTurn == nil || turnID == nil || eventTurn == turnID
+
+        if obj["type"] as? String == "response_item" {
+            if type == "function_call", ["request_user_input", "functions.request_user_input"].contains(payload["name"] as? String ?? "") {
+                state = .waiting; stateChangedAt = date; lastEvidenceAt = date
+                return true
+            }
+            // A final-channel response is explicit completion evidence, unlike commentary.
+            if type == "message", payload["role"] as? String == "assistant",
+               ["final", "final_answer"].contains(payload["phase"] as? String ?? "") {
+                state = .idle; interrupted = false; finishedAt = date
+                stateChangedAt = date; lastEvidenceAt = date
+                return true
+            }
+            let progress = ["reasoning", "function_call", "custom_tool_call", "local_shell_call",
+                            "function_call_output", "custom_tool_call_output", "web_search_call"].contains(type)
+                || (type == "message" && payload["role"] as? String == "assistant")
+            if progress {
+                lastEvidenceAt = date
+                if state == .waiting { state = .working }
+                if state == .unknown { state = .working }
+            }
+            return false
+        }
+        guard obj["type"] as? String == "event_msg" else { return false }
+        switch type {
         case "task_started", "turn_started":
+            // Duplicate starts must not reset a running turn's clock.
+            if eventTurn == nil || eventTurn != turnID { turnStartedAt = date }
+            turnID = eventTurn ?? date.map { String($0.timeIntervalSince1970) }
             state = .working; interrupted = false; finishedAt = nil
-            turnStartedAt = (obj["timestamp"] as? String).flatMap(Self.iso.date(from:)) ?? Date()
+            activity = nil; activityAt = nil; beats.removeAll()
         case "task_complete", "turn_complete":
-            state = .idle; interrupted = false
-            finishedAt = (obj["timestamp"] as? String).flatMap(Self.iso.date(from:)) ?? Date()
+            guard matchesTurn else { return false }
+            turnID = turnID ?? eventTurn
+            state = .idle; interrupted = false; finishedAt = date
         case "turn_aborted":
+            guard matchesTurn else { return false }
+            turnID = turnID ?? eventTurn
             state = .idle; interrupted = true; finishedAt = nil
         case "exec_approval_request", "apply_patch_approval_request",
              "request_user_input", "elicitation_request":
+            guard matchesTurn else { return false }
             state = .waiting
         default:
+            if matchesTurn && ["token_count", "agent_reasoning", "agent_message", "item_completed"].contains(type) {
+                lastEvidenceAt = date
+            }
             return false
         }
+        stateChangedAt = date
+        lastEvidenceAt = date
         return true
+    }
+}
+
+/// Agent logs occur both with and without fractional seconds; invalid timestamps are
+/// unknown evidence, never silently replaced with the current time on each restart.
+enum EventDate {
+    private static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let whole = ISO8601DateFormatter()
+    static func parse(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        return fractional.date(from: value) ?? whole.date(from: value)
     }
 }

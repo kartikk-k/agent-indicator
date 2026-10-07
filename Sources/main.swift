@@ -29,6 +29,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { Layout(rawValue: defaults.string(forKey: "layout") ?? "") ?? .vertical }
         set { defaults.set(newValue.rawValue, forKey: "layout") }
     }
+    private var theme: ShimmerTheme {
+        get { ShimmerTheme(rawValue: defaults.string(forKey: "theme") ?? "") ?? .silver }
+        set { defaults.set(newValue.rawValue, forKey: "theme") }
+    }
+    /// Effect toggles, stored as "effect.<name>" (all on by default).
+    private static let effectNames: [(key: String, title: String, path: WritableKeyPath<Effects, Bool>)] = [
+        ("animatedLogos", "Animated Logos", \.animatedLogos),
+        ("borderGlow", "Border Light", \.borderGlow),
+        ("activityLine", "Activity Line", \.activityLine),
+        ("activityTrace", "Activity Trace", \.activityTrace),
+        ("collapseWhenIdle", "Collapse When Idle", \.collapseWhenIdle),
+    ]
+    private var effects: Effects {
+        var e = Effects()
+        for item in Self.effectNames { e[keyPath: item.path] = flag("effect.\(item.key)", default: true) }
+        return e
+    }
     private var labelMode: LabelMode {
         get { LabelMode(rawValue: defaults.string(forKey: "labels") ?? "") ?? .project }
         set { defaults.set(newValue.rawValue, forKey: "labels") }
@@ -73,6 +90,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         overlay.anchor = anchor
+        overlay.theme = theme
+        overlay.effects = effects
         overlay.onAnchorChange = { [weak self] anchor in self?.anchor = anchor }
         overlay.layout = layout
         overlay.isEnabled = showList
@@ -89,7 +108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let claudeDir = claude.directory.path
         let codexDir = realPath(codex.directory.path)
-        watcher = FileWatcher(paths: [claudeDir, codexDir]) { [weak self] paths in
+        // Transcripts too, so the activity line and trace update as the agent works.
+        let transcripts = claude.projectsDirectory.path
+        watcher = FileWatcher(paths: [claudeDir, transcripts, codexDir]) { [weak self] paths in
             guard let self else { return }
             let codexPaths = paths.filter { $0.hasPrefix(codexDir) && $0.hasSuffix(".jsonl") }
             let allKnown = self.codex.filesChanged(codexPaths)
@@ -101,6 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.refresh(fullCodexScan: true)
         }
         timer?.tolerance = 0.2
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
         refresh(fullCodexScan: true)
     }
 
@@ -110,7 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if enabled(.codex) { raw += codex.sessions(discover: fullCodexScan) }
         let sessions = store.reconcile(raw, showDoneFor: doneWindow)
         if Self.debug {
-            let line = sessions.map { "\($0.agent.rawValue):\($0.info.project):\($0.phase) [\($0.info.title ?? "-")]" }
+            let line = sessions.map { "\($0.agent.rawValue):\($0.info.project):\($0.phase) [\($0.activity ?? "-") ·\($0.beats.count)]" }
                 .joined(separator: "  ")
             FileHandle.standardError.write(Data("\(Date()) \(line)\n".utf8))
         }
@@ -159,7 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabled("No active sessions"))
         } else {
             for s in current {
-                let state = s.phase == .working ? "Working" : s.phase == .waiting ? "Needs input" : "Done"
+                let state = s.phase == .working ? "Working" : s.phase == .waiting ? "Needs input" : s.phase == .unknown ? "Status unconfirmed" : "Done"
                 let name = [s.info.project, s.info.title].compactMap { $0 }.joined(separator: " — ")
                 let item = NSMenuItem(title: "\(name)  ·  \(state)", action: #selector(openFromMenu(_:)), keyEquivalent: "")
                 item.representedObject = s.key
@@ -168,6 +190,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(item)
             }
         }
+        menu.addItem(.separator())
+
+        let reload = NSMenuItem(title: "Refresh Sessions", action: #selector(reloadSessions), keyEquivalent: "r")
+        reload.target = self
+        reload.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh Sessions")
+        menu.addItem(reload)
         menu.addItem(.separator())
 
         let position = NSMenu()
@@ -204,6 +232,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             labels.addItem(item)
         }
         menu.addItem(submenu("Labels", labels))
+
+        let themes = NSMenu()
+        for t in ShimmerTheme.allCases {
+            let item = NSMenuItem(title: t.title, action: #selector(setTheme(_:)), keyEquivalent: "")
+            item.representedObject = t.rawValue
+            item.state = t == theme ? .on : .off
+            item.image = t.swatch
+            item.target = self
+            themes.addItem(item)
+        }
+        menu.addItem(submenu("Theme", themes))
+
+        let effectsMenu = NSMenu()
+        let current = effects
+        for (i, item) in Self.effectNames.enumerated() {
+            let entry = toggle(item.title, current[keyPath: item.path], #selector(toggleEffect(_:)))
+            entry.tag = i
+            effectsMenu.addItem(entry)
+        }
+        menu.addItem(submenu("Effects", effectsMenu))
 
         let done = NSMenu()
         for (title, value) in Self.doneOptions {
@@ -261,6 +309,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    @objc private func reloadSessions() {
+        claude.reload()
+        codex.reload()
+        refresh(fullCodexScan: true, force: true)
+    }
+
     @objc private func setAnchor(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let a = Anchor(rawValue: raw) else { return }
         anchor = a
@@ -275,6 +329,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openFromMenu(_ sender: NSMenuItem) {
         if let key = sender.representedObject as? String { open(key) }
+    }
+
+    @objc private func toggleEffect(_ sender: NSMenuItem) {
+        let item = Self.effectNames[sender.tag]
+        defaults.set(!flag("effect.\(item.key)", default: true), forKey: "effect.\(item.key)")
+        overlay.effects = effects
+    }
+
+    @objc private func setTheme(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let t = ShimmerTheme(rawValue: raw) else { return }
+        theme = t
+        overlay.theme = t
     }
 
     @objc private func setLabelMode(_ sender: NSMenuItem) {

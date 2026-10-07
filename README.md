@@ -8,10 +8,11 @@ When you switch away from your terminal, you lose sight of whether the agent is 
 
 | Row looks like | Meaning |
 | --- | --- |
-| Blue text with a white shimmer + elapsed time | The agent is working (`30s`, `4m`, `1h 5m`) |
+| Shimmering text + elapsed time | The agent is working (`30s`, `4m`, `1h 5m`). The color comes from the theme |
 | Pulsing yellow text | It's waiting for you (permission prompt or question) |
 | Shimmering green text | The turn finished while you were away. It keeps shimmering until you move the mouse or type |
 | Text at 70% opacity | The turn finished |
+| Dim text with “status unconfirmed” (or a **?** icon), no timer | No recent evidence that the agent is working |
 
 A row flashes when its turn finishes or when it starts waiting on you, so you notice even from the corner of your eye. The list resizes to fit the active chats and disappears when nothing is going on.
 
@@ -19,7 +20,7 @@ The menu bar icon mirrors the list: it shows how many chats are working and an o
 
 ## Features
 
-- **Real time.** Updates arrive in about 20 ms and nothing is polled on a timer.
+- **Real time.** File changes trigger updates with a 1.5-second recovery sweep for missed events and closed sessions.
 - **Click to jump.** Clicking a row brings up that session:
   - Terminal.app and iTerm2 select the exact tab.
   - Codex desktop chats open directly with `codex://threads/<id>`.
@@ -34,9 +35,12 @@ The menu bar icon mirrors the list: it shows how many chats are working and an o
 
 Everything lives in the menu bar icon:
 
+- **Refresh Sessions** (`⌘R` while the menu is open): rediscover live sessions and reread their logs. Preserves preferences and does not interrupt agents or reset a valid running turn’s clock.
+
 - **Position**: any corner (top right by default) or the middle of any edge. You can also drag the list anywhere, and it snaps to the nearest of these 8 positions when you let go.
   - **Follow Active Display** (on by default): move to the display you're working on instead of staying on the menu-bar display.
 - **Layout**: vertical (default) or horizontal.
+- **Theme**: the color of working text and its shimmer. Choose Silver (default), Ocean, Sky, Lavender, Rose, Mint or Clay.
 - **Labels**: project name (default), chat title, or icons only. Icons Only shows a spinner, pulsing **!** or green **✓** instead of styled text.
 - **Show Finished**: how long finished chats stay (don't show, 1, 5 (default), 15 or 60 minutes, or while the session is open).
   - **Remove on Hover** (off by default): clear finished chats when the pointer leaves the list, or when you click them.
@@ -76,9 +80,11 @@ The first time you click a Terminal or iTerm2 session, macOS asks for permission
 
 Agent Indicator only reads files the agents already write locally.
 
-**Claude Code** keeps a live registry of running sessions in `~/.claude/sessions/<pid>.json`. Each session rewrites its `status` (`busy`, `shell`, `waiting` or `idle`) the moment it changes, and deletes the file on exit. Chat titles come from the `ai-title` entries in the session transcript under `~/.claude/projects/`.
+**Claude Code** keeps a live registry of running sessions in `~/.claude/sessions/<pid>.json`. Each session rewrites its `status` (`busy`, `shell`, `waiting` or `idle`) the moment it changes, and deletes the file on exit. Only `busy` means an active agent turn; `shell` means the model is idle with a background shell task, such as a dev server. Registry entries are checked against process identity to reject reused PIDs. Chat titles come from the `ai-title` entries in the session transcript under `~/.claude/projects/`.
 
-**Codex** (CLI and desktop app) appends turn events to `~/.codex/sessions/**/rollout-*.jsonl`: `task_started`, `task_complete`, `turn_aborted` and approval requests. A chat counts as open while a Codex process holds its rollout file open, which the app checks with `libproc`. Files are tailed incrementally, so large logs are never re-read. Chat titles come from `~/.codex/session_index.jsonl`.
+**Codex** (CLI and desktop app) appends turn events to `~/.codex/sessions/**/rollout-*.jsonl`: `task_started`, `task_complete`, `turn_aborted` and approval requests. A chat counts as open while a Codex process holds its rollout file open, which the app checks with `libproc`. Files are tailed incrementally. The latest main-thread turn event wins across continuation logs, and a final-channel answer also counts as completion. Partial writes are buffered; replaced or truncated files are reloaded. Chat titles come from `~/.codex/session_index.jsonl`.
+
+An open process or file is not proof of ongoing work. After 10 minutes without activity, a working session becomes **Status unconfirmed**, with no running timer or completion claim. New activity restores it automatically; explicit waits for user input remain waiting. Turn identities keep the elapsed time tied to the current turn even when an idle transition is missed.
 
 Both folders are watched with file-level FSEvents and no coalescing delay. A 1.5-second sweep catches crashed processes and expires finished rows.
 
@@ -94,6 +100,10 @@ Both folders are watched with file-level FSEvents and no coalescing delay. A 1.5
 - Jumping to the exact tab only works in Terminal.app and iTerm2. Other apps are brought to the front, but not to a specific window. tmux isn't supported yet.
 - A Codex session that crashes mid-turn disappears within about 1.5 seconds instead of instantly.
 
+### Regression checks
+
+Run `./test.sh` to check session parsing, continuation ordering, background-shell states, stale evidence, log recovery, and turn clocks.
+
 ## Project layout
 
 ```
@@ -104,6 +114,7 @@ Sources/
   ClaudeSource.swift  Claude Code session registry + chat titles
   CodexSource.swift   Codex rollout tailing + open-file discovery
   Focuser.swift       Click-to-focus (terminal tab / deep link / app)
+  Theme.swift         Shimmer color themes
   FileWatcher.swift   FSEvents wrapper
   DisplayTracker.swift  Follows the display you're working on
 Resources/Info.plist

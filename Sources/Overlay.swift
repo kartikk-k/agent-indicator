@@ -78,6 +78,7 @@ private final class OverlayPanel: NSPanel {
 private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
     var onExit: (() -> Void)?
+    var onEnter: (() -> Void)?
     var press = PressHandlers()
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -92,6 +93,7 @@ private final class FlippedView: NSView {
                                        owner: self))
     }
 
+    override func mouseEntered(with event: NSEvent) { onEnter?() }
     override func mouseExited(with event: NSEvent) { onExit?() }
 }
 
@@ -100,6 +102,11 @@ final class OverlayController {
     private let panel: OverlayPanel
     private let background = NSVisualEffectView()
     private let container = FlippedView()
+    private let beam = BeamView()
+    private var hovering = false
+    private var collapsed = false
+    private var lastChange = Date()
+    private static let collapseDelay: TimeInterval = 6
     private var rows: [String: RowView] = [:]
     private var order: [String] = []
     private var clock: Timer?
@@ -122,6 +129,13 @@ final class OverlayController {
     var onAnchorChange: ((Anchor) -> Void)?
     /// Off hides the list entirely (the menu bar icon still shows status).
     var isEnabled = true { didSet { updateVisibility() } }
+    var theme: ShimmerTheme = .silver {
+        didSet {
+            ShimmerTheme.current = theme
+            rows.values.forEach { $0.applyTheme() }
+            updateBeam()
+        }
+    }
     var showsElapsedTime = true {
         didSet {
             rows.values.forEach { $0.showsTime = showsElapsedTime }
@@ -131,9 +145,15 @@ final class OverlayController {
     /// A row was clicked.
     var onClick: ((String) -> Void)?
     /// The pointer left the list (the user has had a look).
-    var onExit: (() -> Void)? {
-        get { container.onExit }
-        set { container.onExit = newValue }
+    var onExit: (() -> Void)?
+    var effects = Effects() {
+        didSet {
+            Effects.current = effects
+            rows.values.forEach { $0.applyEffects() }
+            updateBeam()
+            updateCollapse()
+            relayout()
+        }
     }
 
     private let margin: CGFloat = 10
@@ -156,8 +176,21 @@ final class OverlayController {
         background.blendingMode = .behindWindow
         background.state = .active
         background.addSubview(container)
+        beam.frame = background.bounds
+        beam.autoresizingMask = [.width, .height]
+        background.addSubview(beam)
         panel.contentView = background
         container.press = pressHandlers
+        container.onEnter = { [weak self] in
+            self?.hovering = true
+            self?.updateCollapse()
+        }
+        container.onExit = { [weak self] in
+            guard let self else { return }
+            self.hovering = false
+            self.lastChange = Date()          // stay open a moment after you look away
+            self.onExit?()
+        }
 
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -183,6 +216,9 @@ final class OverlayController {
             let row = rows[s.key] ?? {
                 let r = RowView(key: s.key, agent: s.agent)
                 r.onClick = { [weak self] key in self?.onClick?(key) }
+                r.onFinish = { [weak self] in
+                    if Effects.current.borderGlow { self?.beam.celebrate() }
+                }
                 r.press = pressHandlers
                 r.showsTime = showsElapsedTime
                 r.frame = .zero                        // marks it as new for the fade-in
@@ -190,11 +226,19 @@ final class OverlayController {
                 rows[s.key] = r
                 return r
             }()
+            if row.phase != s.phase || row.superview == nil { lastChange = Date() }
             row.label = labels[s.key]
             row.since = s.since
+            row.activity = s.activity
+            row.beats = s.beats
             row.phase = s.phase
+            row.toolTip = s.phase == .unknown ? "Status unconfirmed: no recent activity. Click to check the session." : nil
+            row.compact = collapsed
         }
+        if order != sessions.map(\.key) { lastChange = Date() }
         order = sessions.map(\.key)
+        updateBeam()
+        updateCollapse()
         relayout()
         updateVisibility()
         watchForPresence()
@@ -226,11 +270,41 @@ final class OverlayController {
     }
 
     private func tick() {
-        guard panel.isVisible, showsElapsedTime else { return }
+        guard panel.isVisible else { return }
+        updateCollapse()
         let now = Date()
+        rows.values.forEach { $0.tickTrace() }
+        guard showsElapsedTime else { return }
         var changed = false
         for row in rows.values where row.updateTime(now: now) { changed = true }
         if changed { relayout() }
+    }
+
+    /// Border light: pulsing when something waits on you, a travelling comet while anything works.
+    private func updateBeam() {
+        let phases = rows.values.map(\.phase)
+        beam.capsule = layout == .horizontal
+        if !Effects.current.borderGlow {
+            beam.set(.off)
+        } else if phases.contains(.waiting) {
+            beam.set(.waiting(RowView.attention))
+        } else if phases.contains(.working) {
+            beam.set(.working(ShimmerTheme.current.text.withAlphaComponent(1)))
+        } else {
+            beam.set(.off)
+        }
+    }
+
+    /// Shrinks to just the logos once every chat is finished (and seen), nobody's hovering,
+    /// and nothing has changed for a few seconds. Anything new expands it again.
+    private func updateCollapse() {
+        let idle = Effects.current.collapseWhenIdle && !hovering && !rows.isEmpty
+            && rows.values.allSatisfy { $0.phase == .done && !$0.unseen }
+            && Date().timeIntervalSince(lastChange) > Self.collapseDelay
+        guard idle != collapsed else { return }
+        collapsed = idle
+        rows.values.forEach { $0.compact = idle }
+        relayout()
     }
 
     // MARK: Dragging
@@ -307,20 +381,23 @@ final class OverlayController {
 
         switch layout {
         case .vertical:
-            let rowWidth = list.map(\.preferredWidth).max() ?? RowView.minWidth
-            for (i, row) in list.enumerated() {
-                frames.append((row, NSRect(x: inset, y: inset + CGFloat(i) * rowHeight, width: rowWidth, height: rowHeight)))
+            let rowWidth = list.map(\.preferredWidth).max() ?? rowHeight
+            var y = inset
+            for row in list {
+                frames.append((row, NSRect(x: inset, y: y, width: rowWidth, height: row.preferredHeight)))
+                y += row.preferredHeight
             }
             width = rowWidth + inset * 2
-            height = CGFloat(max(1, list.count)) * rowHeight + inset * 2
+            height = max(y, inset + rowHeight) + inset
         case .horizontal:
+            let tallest = list.map(\.preferredHeight).max() ?? rowHeight
             var x = inset
             for row in list {
-                frames.append((row, NSRect(x: x, y: inset, width: row.preferredWidth, height: rowHeight)))
+                frames.append((row, NSRect(x: x, y: inset, width: row.preferredWidth, height: tallest)))
                 x += row.preferredWidth
             }
-            width = max(x, RowView.minWidth + inset) + inset
-            height = rowHeight + inset * 2
+            width = max(x, rowHeight + inset) + inset
+            height = tallest + inset * 2
         }
 
         let frame = anchor.frame(size: NSSize(width: width, height: height), in: screen.visibleFrame, margin: margin)
@@ -399,8 +476,11 @@ final class OverlayController {
 /// A row flashes once when its turn finishes or it starts waiting on you.
 private final class RowView: NSView {
     static let height: CGFloat = 24
+    static let tallHeight: CGFloat = 38               // with the activity line
     static let minWidth: CGFloat = 6 + 16 + 5 + 13 + 6
+    static let compactWidth: CGFloat = 6 + 16 + 6
     private static let maxLabelWidth: CGFloat = 150
+    private static let activityColumn: CGFloat = 170
     private static let restingAlpha: CGFloat = 0.7   // finished text
 
     /// Yellow reads well on the dark material; on the light one it needs to be orange to be legible.
@@ -408,13 +488,12 @@ private final class RowView: NSView {
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .systemYellow : .systemOrange
     }
 
-    /// In progress: #0088F5.
-    static let active = NSColor(srgbRed: 0, green: 0x88 / 255.0, blue: 0xF5 / 255.0, alpha: 1)
-    /// Strength of the white highlight that sweeps across shimmering text.
-    private static let highlightAlpha: CGFloat = 0.6
+    /// Highlight for the green "finished while you were away" shimmer.
+    private static let unseenHighlight = NSColor.white.withAlphaComponent(0.6)
 
     let key: String
     var onClick: ((String) -> Void)?
+    var onFinish: (() -> Void)?
     var press = PressHandlers()
     var phase: Phase = .done {
         didSet {
@@ -423,8 +502,19 @@ private final class RowView: NSView {
             if justFinished { finishedAt = Date() }
             unseen = justFinished                         // re-renders
             if phase == .waiting || justFinished { flash() }
+            if justFinished { onFinish?() }
         }
     }
+    /// Collapsed list: just the logo.
+    var compact = false { didSet { if compact != oldValue { render(); needsLayout = true } } }
+    var activity: String? {
+        didSet {
+            guard activity != oldValue else { return }
+            activityLabel.stringValue = activity ?? ""
+            render()
+        }
+    }
+    var beats: [Date] = [] { didSet { trace.beats = beats } }
     /// Finished while you weren't touching the Mac: shimmers green until you're back.
     var unseen = false { didSet { render() } }
     private(set) var finishedAt = Date.distantPast
@@ -440,7 +530,9 @@ private final class RowView: NSView {
     var since: Date? { didSet { if since != oldValue { _ = updateTime(now: Date()) } } }
     var showsTime = true { didSet { if showsTime != oldValue { _ = updateTime(now: Date()) } } }
 
-    private let logo = NSImageView()
+    private let logo: LogoView
+    private let activityLabel = NSTextField(labelWithString: "")
+    private let trace = TraceView(frame: NSRect(origin: .zero, size: TraceView.size))
     private let textHost = NSView()           // pulsed when waiting
     private let highlightHost = NSView()      // white copy of the label, masked to the moving band
     private let highlight = NSTextField(labelWithString: "")
@@ -452,7 +544,14 @@ private final class RowView: NSView {
     private let badge = NSImageView()
     private var hovered = false { didSet { updateHighlight() } }
 
-    private var timeVisible: Bool { !time.stringValue.isEmpty && label != nil }
+    private var timeVisible: Bool { !time.stringValue.isEmpty && label != nil && !compact }
+    private var activityVisible: Bool {
+        Effects.current.activityLine && !compact && label != nil && phase != .done && !(activity ?? "").isEmpty
+    }
+    private var traceVisible: Bool {
+        Effects.current.activityTrace && !compact && label != nil && phase != .done
+    }
+    var preferredHeight: CGFloat { activityVisible ? Self.tallHeight : Self.height }
     private var timeWidth: CGFloat {
         let reserve = ("00m" as NSString).size(withAttributes: [.font: time.font!]).width
         let actual = (time.stringValue as NSString).size(withAttributes: [.font: time.font!]).width
@@ -460,14 +559,20 @@ private final class RowView: NSView {
     }
 
     var preferredWidth: CGFloat {
+        if compact { return Self.compactWidth }
         guard label != nil else { return Self.minWidth }
         let measured = (text.stringValue as NSString).size(withAttributes: [.font: text.font!]).width
         let timePart = timeVisible ? 6 + timeWidth : 0
-        return 28 + min(ceil(measured) + 4, Self.maxLabelWidth) + timePart + 8
+        let tracePart = traceVisible ? 6 + TraceView.size.width : 0
+        var column = min(ceil(measured) + 4, Self.maxLabelWidth)
+        // A fixed column while the activity line shows, so its changing text doesn't resize the list.
+        if activityVisible { column = max(column, Self.activityColumn - tracePart - timePart) }
+        return 28 + column + tracePart + timePart + 8
     }
 
     init(key: String, agent: Agent) {
         self.key = key
+        logo = LogoView(agent: agent)
         super.init(frame: NSRect(x: 0, y: 0, width: Self.minWidth, height: Self.height))
         wantsLayer = true
         layer?.cornerRadius = 7
@@ -476,15 +581,15 @@ private final class RowView: NSView {
         glow.opacity = 0
         layer?.addSublayer(glow)
 
-        logo.image = AgentIcon.image(for: agent)
-        logo.imageScaling = .scaleProportionallyUpOrDown
+        activityLabel.font = .systemFont(ofSize: 10.5)
+        activityLabel.textColor = .secondaryLabelColor
+        activityLabel.lineBreakMode = .byTruncatingTail
         text.font = .systemFont(ofSize: 12, weight: .regular)
         text.lineBreakMode = .byTruncatingTail
         textHost.wantsLayer = true
         textHost.addSubview(text)
         highlight.font = text.font
         highlight.lineBreakMode = .byTruncatingTail
-        highlight.textColor = NSColor.white.withAlphaComponent(Self.highlightAlpha)
         highlightHost.wantsLayer = true
         highlightHost.isHidden = true
         highlightHost.addSubview(highlight)
@@ -503,7 +608,7 @@ private final class RowView: NSView {
         shimmer.endPoint = CGPoint(x: 1, y: 0.5)
         shimmer.locations = [0, 0.15, 0.3]
 
-        for v in [logo, textHost, time, spinner, badge] as [NSView] { addSubview(v) }
+        for v in [logo, textHost, activityLabel, trace, time, spinner, badge] as [NSView] { addSubview(v) }
         render()
     }
 
@@ -514,6 +619,8 @@ private final class RowView: NSView {
     override func layout() {
         super.layout()
         let midY = bounds.midY
+        // With the activity line, the label sits on the upper line and the logo stays centred.
+        let lineY = activityVisible ? 12.5 : midY
         logo.frame = NSRect(x: 6, y: midY - 8, width: 16, height: 16)
         let statusRect = NSRect(x: bounds.maxX - 6 - 13, y: midY - 6.5, width: 13, height: 13)
         spinner.frame = statusRect
@@ -522,11 +629,20 @@ private final class RowView: NSView {
         var textRight = bounds.maxX - 8
         if timeVisible {
             let h = ceil(time.intrinsicContentSize.height)
-            time.frame = NSRect(x: textRight - timeWidth, y: midY - h / 2, width: timeWidth, height: h)
+            time.frame = NSRect(x: textRight - timeWidth, y: lineY - h / 2, width: timeWidth, height: h)
             textRight = time.frame.minX - 6
         }
+        if traceVisible {
+            trace.frame = NSRect(x: textRight - TraceView.size.width, y: lineY - TraceView.size.height / 2,
+                                 width: TraceView.size.width, height: TraceView.size.height)
+            textRight = trace.frame.minX - 6
+        }
+        if activityVisible {
+            let h = ceil(activityLabel.intrinsicContentSize.height)
+            activityLabel.frame = NSRect(x: 28, y: 25.5 - h / 2, width: max(0, bounds.maxX - 8 - 28), height: h)
+        }
         let textHeight = ceil(text.intrinsicContentSize.height)
-        textHost.frame = NSRect(x: 28, y: midY - textHeight / 2, width: max(0, textRight - 28), height: textHeight)
+        textHost.frame = NSRect(x: 28, y: lineY - textHeight / 2, width: max(0, textRight - 28), height: textHeight)
         text.frame = textHost.bounds
         highlightHost.frame = textHost.bounds
         highlight.frame = highlightHost.bounds
@@ -564,19 +680,43 @@ private final class RowView: NSView {
         return "\(s / 3600)h \(s % 3600 / 60)m"
     }
 
+    /// Re-applies colours after the theme changes.
+    func applyTheme() {
+        render()
+        spinner.updateColor()
+    }
+
+    /// Re-applies the effect toggles (activity line, trace, animated logo).
+    func applyEffects() {
+        render()
+        needsLayout = true
+    }
+
+    /// Redraws the trace so it scrolls with time.
+    func tickTrace() {
+        if traceVisible { trace.needsDisplay = true }
+    }
+
     private func render() {
-        let labelled = label != nil
+        let labelled = label != nil && !compact
         textHost.isHidden = !labelled
-        spinner.isHidden = labelled || phase != .working
-        badge.isHidden = labelled || phase == .working
+        spinner.isHidden = compact || labelled || phase != .working
+        badge.isHidden = compact || labelled || phase == .working
+        activityLabel.isHidden = !activityVisible
+        trace.isHidden = !traceVisible
+        trace.color = phase == .waiting ? Self.attention : ShimmerTheme.current.text.withAlphaComponent(1)
+        logo.animating = Effects.current.animatedLogos && phase == .working
+        logo.alphaValue = compact && phase == .done ? 0.7 : 1
         _ = updateTime(now: Date())
 
         if labelled {
             switch phase {
-            case .working: text.textColor = Self.active          // blue shimmer = in progress
+            case .unknown: text.textColor = .secondaryLabelColor
+            case .working: text.textColor = ShimmerTheme.current.text
             case .waiting: text.textColor = Self.attention
             case .done: text.textColor = unseen ? .systemGreen : NSColor.labelColor.withAlphaComponent(Self.restingAlpha)
             }
+            highlight.textColor = phase == .working ? ShimmerTheme.current.highlight : Self.unseenHighlight
             setShimmering(phase == .working || (phase == .done && unseen))   // green shimmer when unseen
             setPulsing(textHost, phase == .waiting)
             setPulsing(badge, false)
@@ -584,6 +724,7 @@ private final class RowView: NSView {
             setShimmering(false)
             setPulsing(textHost, false)
             switch phase {
+            case .unknown: badge.image = Self.symbol("questionmark.circle", .secondaryLabelColor)
             case .working: break
             case .waiting: badge.image = Self.symbol("exclamationmark.circle.fill", Self.attention)
             case .done: badge.image = Self.symbol("checkmark.circle.fill", .systemGreen)
@@ -701,9 +842,9 @@ private final class SpinnerView: NSView {
     override func viewDidMoveToWindow() { startIfNeeded() }
     override func viewDidChangeEffectiveAppearance() { updateColor() }
 
-    private func updateColor() {
+    func updateColor() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            arc.strokeColor = RowView.active.cgColor
+            arc.strokeColor = ShimmerTheme.current.text.withAlphaComponent(1).cgColor
         }
     }
 

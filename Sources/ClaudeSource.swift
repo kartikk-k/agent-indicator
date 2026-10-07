@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Reads the live session registry Claude Code maintains at ~/.claude/sessions/<pid>.json.
 /// Each running session rewrites its file whenever its status changes
@@ -6,13 +7,23 @@ import Foundation
 final class ClaudeSource {
     let directory: URL
     private let projects: URL
-    private var titles: [String: CachedTitle] = [:]
+    private var transcripts: [String: Transcript] = [:]
 
-    private struct CachedTitle {
+    /// What we've learned from a session's transcript, re-read whenever the file grows.
+    private struct Transcript {
+        var size: UInt64 = 0
+        var modifiedAt: Date?
+        var fileIdentity: UInt64?
         var title: String?
-        var mtime: Date
-        var checkedAt: Date
+        var activity: String?
+        var beats: [Date] = []
+        var lastActivityAt: Date?
+        var turnStartedAt: Date?
+        var turnID: String?
     }
+
+    /// Transcripts live here; the app watches it so activity updates as it's written.
+    var projectsDirectory: URL { projects }
 
     init() {
         let base = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"].map { URL(fileURLWithPath: $0) }
@@ -21,25 +32,34 @@ final class ClaudeSource {
         projects = base.appendingPathComponent("projects")
     }
 
+    func reload() { transcripts.removeAll() }
+
+    /// `shell` is emitted when the model is idle but a background bash task remains.
+    /// A dev server is not an unfinished agent turn.
+    static func registryState(_ status: String?) -> RawState {
+        switch status {
+        case "busy": return .working
+        case "waiting": return .waiting
+        case "idle", "shell": return .idle
+        default: return .unknown
+        }
+    }
+
     func sessions() -> [RawSession] {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
         var out: [RawSession] = []
 
         for name in names where name.hasSuffix(".json") {
-            guard let pid = Int32(name.dropLast(5)), processAlive(pid),
+            guard let pid = Int32(name.dropLast(5)),
                   let data = try? Data(contentsOf: directory.appendingPathComponent(name)),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  processMatches(pid, registry: obj)
             else { continue }
 
             let kind = obj["kind"] as? String ?? "interactive"
             if kind.hasPrefix("daemon") { continue }
 
-            let state: RawState
-            switch obj["status"] as? String {
-            case "busy", "shell": state = .working
-            case "waiting": state = .waiting
-            default: state = .idle
-            }
+            var state = Self.registryState(obj["status"] as? String)
 
             var finishedAt: Date?
             if state == .idle,
@@ -50,61 +70,117 @@ final class ClaudeSource {
             }
 
             let cwd = obj["cwd"] as? String ?? ""
-            var title: String?
+            let transcript = (obj["sessionId"] as? String).map { readTranscript(sessionID: $0, cwd: cwd) }
+            let statusAt = (obj["statusUpdatedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
+            state = SessionEvidence.state(state, lastActivity: [statusAt, transcript?.lastActivityAt].compactMap { $0 }.max())
+            var title = transcript?.title
             if obj["nameSource"] as? String == "user", let n = obj["name"] as? String, !n.isEmpty {
                 title = n                                        // set with /rename
-            } else if let sid = obj["sessionId"] as? String {
-                title = aiTitle(sessionID: sid, cwd: cwd)
             }
+            var activity = transcript?.activity
+            if state == .waiting { activity = (obj["waitingFor"] as? String).map { "Needs \($0)" } ?? "Needs your input" }
+            if state == .unknown { activity = "No recent activity · status unconfirmed" }
 
             // statusUpdatedAt is when it last became busy; a close enough turn start for a fresh launch.
-            let turnStartedAt = state == .idle ? nil
-                : (obj["statusUpdatedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
+            let turnStartedAt = state == .idle ? nil : transcript?.turnStartedAt ?? statusAt
 
             let info = SessionInfo(project: URL(fileURLWithPath: cwd).lastPathComponent,
                                    title: title, pid: pid, deepLink: nil)
-            out.append(RawSession(key: "claude:\(pid)", agent: .claude, info: info,
-                                  state: state, finishedAt: finishedAt, turnStartedAt: turnStartedAt))
+            let identity = obj["sessionId"] as? String ?? String(describing: obj["startedAt"] ?? "")
+            out.append(RawSession(key: "claude:\(pid):\(identity)", agent: .claude, info: info,
+                                  state: state, finishedAt: finishedAt, turnStartedAt: turnStartedAt,
+                                  activity: activity, beats: transcript?.beats ?? [], turnID: transcript?.turnID))
         }
         return out
     }
 
-    private func processAlive(_ pid: Int32) -> Bool {
-        kill(pid, 0) == 0 || errno == EPERM
-    }
-
-    /// The short title Claude Code generates for a chat, stored as "ai-title" entries in its transcript.
-    private func aiTitle(sessionID: String, cwd: String) -> String? {
-        let folder = String(cwd.map { $0.isLetter || $0.isNumber ? $0 : "-" })
-        let path = projects.appendingPathComponent(folder).appendingPathComponent("\(sessionID).jsonl").path
-        let now = Date()
-        if let c = titles[sessionID], now.timeIntervalSince(c.checkedAt) < 5 { return c.title }
-
-        guard let mtime = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
-        else { return titles[sessionID]?.title }
-        if let c = titles[sessionID], c.mtime == mtime {
-            titles[sessionID]?.checkedAt = now
-            return c.title
-        }
-
-        let title = lastTitle(inTailOf: path) ?? titles[sessionID]?.title
-        titles[sessionID] = CachedTitle(title: title, mtime: mtime, checkedAt: now)
-        return title
-    }
-
-    private func lastTitle(inTailOf path: String) -> String? {
-        guard let h = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        try? h.seek(toOffset: size > 1_000_000 ? size - 1_000_000 : 0)
-        guard let data = try? h.readToEnd() else { return nil }
-        let marker = Data(#""type":"ai-title""#.utf8)
-        for line in data.split(separator: 0x0A).reversed() where line.range(of: marker) != nil {
-            if let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-               let t = obj["aiTitle"] as? String, !t.isEmpty {
-                return t
+    private func processMatches(_ pid: Int32, registry: [String: Any]) -> Bool {
+        guard pid > 0, kill(pid, 0) == 0 || errno == EPERM else { return false }
+        // A stale registry file must not attach to an unrelated process that reused its PID.
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return false }
+        if let recorded = registry["procStart"] as? String {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+            if let start = formatter.date(from: recorded) {
+                return abs(start.timeIntervalSince1970 - Double(info.pbi_start_tvsec)) < 1
             }
         }
-        return nil
+        var name = [CChar](repeating: 0, count: 256)
+        return proc_name(pid, &name, UInt32(name.count)) > 0 && String(cString: name).lowercased().contains("claude")
+    }
+
+    /// Title ("ai-title" entries), current activity and recent tool-call times from the
+    /// session's transcript. Only the tail is read, and only when the file has grown.
+    private func readTranscript(sessionID: String, cwd: String) -> Transcript {
+        let folder = String(cwd.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        let path = projects.appendingPathComponent(folder).appendingPathComponent("\(sessionID).jsonl").path
+        var t = transcripts[sessionID] ?? Transcript()
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attrs[.size] as? UInt64 else { return t }
+        let modifiedAt = attrs[.modificationDate] as? Date
+        let identity = attrs[.systemFileNumber] as? UInt64
+        guard size != t.size || modifiedAt != t.modifiedAt || identity != t.fileIdentity,
+              let h = FileHandle(forReadingAtPath: path) else { return t }
+        if size < t.size || identity != t.fileIdentity { t = Transcript() }
+        defer { try? h.close() }
+
+        let window: UInt64 = t.size == 0 ? 1_500_000 : 400_000   // first read looks further back for a title
+        try? h.seek(toOffset: size > window ? size - window : 0)
+        guard let data = try? h.readToEnd() else { return t }
+        t.size = size
+        t.modifiedAt = modifiedAt
+        t.fileIdentity = identity
+
+        let titleMarker = Data(#""type":"ai-title""#.utf8)
+        let assistant = Data(#""type":"assistant""#.utf8)
+        let user = Data(#""type":"user""#.utf8)
+        let horizon = Date().addingTimeInterval(-Activity.traceWindow)
+        var foundTitle = false, foundActivity = false, foundPrompt = false, beats: [Date] = []
+
+        for line in data.split(separator: 0x0A).reversed() {
+            let isTitle = !foundTitle && line.range(of: titleMarker) != nil
+            let isAssistant = line.range(of: assistant) != nil
+            let isUser = line.range(of: user) != nil
+            guard isTitle || isAssistant || isUser, line.count < 1_000_000,
+                  let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+
+            if isTitle, let title = obj["aiTitle"] as? String, !title.isEmpty {
+                t.title = title; foundTitle = true
+                continue
+            }
+            let date = EventDate.parse(obj["timestamp"] as? String)
+            if let date { t.lastActivityAt = max(t.lastActivityAt ?? .distantPast, date) }
+            let content = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
+            let tools = content.filter { $0["type"] as? String == "tool_use" }
+            if obj["type"] as? String == "user", !foundPrompt, obj["isMeta"] as? Bool != true,
+               !content.contains(where: { $0["type"] as? String == "tool_result" }), let date {
+                foundPrompt = true
+                t.turnStartedAt = date
+                t.turnID = obj["uuid"] as? String ?? String(date.timeIntervalSince1970)
+            }
+
+            if obj["type"] as? String == "assistant" {
+                if let date, date > horizon { beats.append(contentsOf: Array(repeating: date, count: tools.count)) }
+                if !foundActivity {
+                    foundActivity = true
+                    if let last = tools.last, let name = last["name"] as? String {
+                        t.activity = Activity.claudeTool(name, last["input"] as? [String: Any] ?? [:])
+                    } else {
+                        t.activity = content.last?["type"] as? String == "thinking" ? "Thinking" : "Writing a reply"
+                    }
+                }
+            } else if obj["type"] as? String == "user", !foundActivity {
+                foundActivity = true
+                t.activity = "Thinking"      // a new prompt or tool results: the model's up next
+            }
+            if foundActivity && foundTitle && foundPrompt, let date, date < horizon { break }
+        }
+        t.beats = beats.sorted()
+        transcripts[sessionID] = t
+        return t
     }
 }
