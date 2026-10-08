@@ -686,7 +686,7 @@ private final class RowView: NSView {
         spinner.updateColor()
     }
 
-    /// Re-applies the effect toggles (activity line, trace, animated logo).
+    /// Re-applies the activity line and trace effect toggles.
     func applyEffects() {
         render()
         needsLayout = true
@@ -705,7 +705,6 @@ private final class RowView: NSView {
         activityLabel.isHidden = !activityVisible
         trace.isHidden = !traceVisible
         trace.color = phase == .waiting ? Self.attention : ShimmerTheme.current.text.withAlphaComponent(1)
-        logo.animating = Effects.current.animatedLogos && phase == .working
         logo.alphaValue = compact && phase == .done ? 0.7 : 1
         _ = updateTime(now: Date())
 
@@ -726,8 +725,8 @@ private final class RowView: NSView {
             switch phase {
             case .unknown: badge.image = Self.symbol("questionmark.circle", .secondaryLabelColor)
             case .working: break
-            case .waiting: badge.image = Self.symbol("exclamationmark.circle.fill", Self.attention)
-            case .done: badge.image = Self.symbol("checkmark.circle.fill", .systemGreen)
+            case .waiting: badge.image = Self.symbol("exclamationmark.circle", Self.attention)
+            case .done: badge.image = Self.symbol("checkmark.circle", .systemGreen)
             }
             setPulsing(badge, phase == .waiting)
         }
@@ -809,8 +808,8 @@ private final class RowView: NSView {
     }
 
     private static func symbol(_ name: String, _ color: NSColor) -> NSImage? {
-        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
-            .applying(.init(paletteColors: [.white, color]))
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+            .applying(.init(paletteColors: [color]))
         return NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config)
     }
 }

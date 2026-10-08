@@ -76,7 +76,7 @@ final class CodexSource {
             let horizon = now.addingTimeInterval(-Activity.traceWindow)
             let beats = currentParts.flatMap(\.beats).filter { $0 > horizon }.sorted()
             let activity = state == .unknown ? "No recent activity · status unconfirmed"
-                : state == .waiting ? "Needs your input" : latest?.activity
+                : state == .waiting ? (main.hasPendingQuestions ? "Needs your input · Shift+←" : "Needs your input") : latest?.activity
             let info = SessionInfo(project: main.title, title: threadNames[id], pid: main.pid,
                                    deepLink: URL(string: "codex://threads/\(id)"))
             return RawSession(key: "codex:\(id)", agent: .codex, info: info, state: state,
@@ -147,7 +147,14 @@ final class RolloutFile {
     private(set) var sessionID: String?
     private(set) var isSubagent = false
     var pid: pid_t?
-    private(set) var state: RawState = .idle
+    private var reportedState: RawState = .idle
+    /// Async questions remain actionable while the agent continues working or finishes.
+    private var pendingQuestions: [String: Set<Int>] = [:]
+    var hasPendingQuestions: Bool { !pendingQuestions.isEmpty }
+    private(set) var state: RawState {
+        get { pendingQuestions.isEmpty ? reportedState : .waiting }
+        set { reportedState = newValue }
+    }
     private(set) var finishedAt: Date?
     private(set) var turnStartedAt: Date?
     private(set) var activity: String?
@@ -170,6 +177,7 @@ final class RolloutFile {
 
     private func load() {
         title = "Codex"; sessionID = nil; isSubagent = false
+        pendingQuestions.removeAll()
         state = .idle; finishedAt = nil; turnStartedAt = nil; turnID = nil
         stateChangedAt = nil; lastEvidenceAt = nil; activity = nil; activityAt = nil
         beats.removeAll(); interrupted = false; offset = 0; partial.removeAll()
@@ -264,6 +272,37 @@ final class RolloutFile {
         if let first = beats.first, first < horizon { beats.removeAll { $0 < horizon } }
     }
 
+    private func registerQuestions(_ payload: [String: Any], id: String?) {
+        guard let id, let questions = payload["questions"] as? [[String: Any]], !questions.isEmpty else { return }
+        // The tool call and its UI event describe the same question batch.
+        if pendingQuestions[id] == nil { pendingQuestions[id] = Set(questions.indices) }
+    }
+
+    private func answerQuestions(_ content: Any?) -> Bool {
+        guard let content = content as? [[String: Any]] else { return false }
+        var changed = false
+        for part in content {
+            guard let text = part["text"] as? String else { continue }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let opening = "<send_user_message_question_reply>"
+            let closing = "</send_user_message_question_reply>"
+            guard trimmed.hasPrefix(opening), trimmed.hasSuffix(closing) else { continue }
+            let body = trimmed.dropFirst(opening.count).dropLast(closing.count)
+            guard let replies = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [[String: Any]] else { continue }
+            for reply in replies {
+                guard let item = reply["questionItemId"] as? String,
+                      let identity = try? JSONSerialization.jsonObject(with: Data(item.utf8)) as? [Any],
+                      identity.count == 3,
+                      let tool = identity[0] as? String, tool.split(separator: ".").last == "request_user_input_async",
+                      let call = identity[1] as? String, let index = identity[2] as? Int,
+                      pendingQuestions[call]?.remove(index) != nil else { continue }
+                changed = true
+                if pendingQuestions[call]?.isEmpty == true { pendingQuestions[call] = nil }
+            }
+        }
+        return changed
+    }
+
     @discardableResult
     private func apply(_ line: Data) -> Bool {
         noteActivity(line)
@@ -286,6 +325,20 @@ final class RolloutFile {
         let matchesTurn = eventTurn == nil || turnID == nil || eventTurn == turnID
 
         if obj["type"] as? String == "response_item" {
+            if type == "function_call",
+               (payload["name"] as? String)?.split(separator: ".").last == "request_user_input_async" {
+                if let arguments = payload["arguments"] as? String,
+                   let questions = try? JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: Any] {
+                    registerQuestions(questions, id: payload["call_id"] as? String)
+                }
+                stateChangedAt = date; lastEvidenceAt = date
+                return true
+            }
+            if type == "message", payload["role"] as? String == "user",
+               answerQuestions(payload["content"]) {
+                stateChangedAt = date; lastEvidenceAt = date
+                return true
+            }
             if type == "function_call", ["request_user_input", "functions.request_user_input"].contains(payload["name"] as? String ?? "") {
                 state = .waiting; stateChangedAt = date; lastEvidenceAt = date
                 return true
@@ -302,13 +355,23 @@ final class RolloutFile {
                 || (type == "message" && payload["role"] as? String == "assistant")
             if progress {
                 lastEvidenceAt = date
-                if state == .waiting { state = .working }
+                if reportedState == .waiting { state = .working }
                 if state == .unknown { state = .working }
             }
             return false
         }
         guard obj["type"] as? String == "event_msg" else { return false }
         switch type {
+        case "item_completed":
+            guard matchesTurn, let item = payload["item"] as? [String: Any] else { return false }
+            if item["type"] as? String == "AgentMessage", item["delivery"] as? String == "async" {
+                registerQuestions(item, id: item["id"] as? String)
+            } else if item["type"] as? String == "UserMessage" {
+                guard answerQuestions(item["content"]) else { return false }
+            } else {
+                lastEvidenceAt = date
+                return false
+            }
         case "task_started", "turn_started":
             // Duplicate starts must not reset a running turn's clock.
             if eventTurn == nil || eventTurn != turnID { turnStartedAt = date }
@@ -321,6 +384,7 @@ final class RolloutFile {
             state = .idle; interrupted = false; finishedAt = date
         case "turn_aborted":
             guard matchesTurn else { return false }
+            pendingQuestions.removeAll()
             turnID = turnID ?? eventTurn
             state = .idle; interrupted = true; finishedAt = nil
         case "exec_approval_request", "apply_patch_approval_request",

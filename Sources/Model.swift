@@ -63,6 +63,9 @@ struct Session: Equatable {
 
 /// Turns raw source state into what the overlay shows, remembering when turns finished.
 final class SessionStore {
+    /// Fresh completions from the latest reconciliation, independent of row visibility.
+    private(set) var completedKeys: Set<String> = []
+    private(set) var inputRequiredKeys: Set<String> = []
     private var lastState: [String: RawState] = [:]
     private var doneAt: [String: Date] = [:]
     private var turnStart: [String: Date] = [:]
@@ -78,6 +81,8 @@ final class SessionStore {
     }
 
     func reconcile(_ raw: [RawSession], showDoneFor window: TimeInterval?) -> [Session] {
+        completedKeys.removeAll()
+        inputRequiredKeys.removeAll()
         let now = Date()
         var live = Set<String>()
         var out: [Session] = []
@@ -87,6 +92,9 @@ final class SessionStore {
             if firstSeen[r.key] == nil { counter += 1; firstSeen[r.key] = counter }
             let previous = lastState[r.key]
             lastState[r.key] = r.state
+            if let previous, previous != .waiting, r.state == .waiting {
+                inputRequiredKeys.insert(r.key)
+            }
 
             switch r.state {
             case .working, .waiting:
@@ -106,6 +114,7 @@ final class SessionStore {
                     doneAt[r.key] = nil
                 } else if let previous, previous != .idle {
                     doneAt[r.key] = r.finishedAt ?? now
+                    completedKeys.insert(r.key)
                 } else if previous == nil, let f = r.finishedAt {
                     doneAt[r.key] = f
                 }

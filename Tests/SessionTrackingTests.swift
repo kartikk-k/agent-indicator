@@ -76,6 +76,48 @@ struct SessionTrackingTests {
         check(waiting.state == .waiting, "Bookkeeping cannot answer a user prompt")
         try append(waiting, line("response_item", ["type": "function_call_output", "output": "ok"], 3))
         check(waiting.state == .working, "Tool result resumes a waiting turn")
+        func asyncQuestion(_ id: String, count: Int = 1, qualified: Bool = false) -> Data {
+            let args = try! JSONSerialization.data(withJSONObject: ["questions": Array(repeating: ["title": "Choose"], count: count)])
+            return line("response_item", ["type": "function_call", "name": qualified ? "functions.request_user_input_async" : "request_user_input_async",
+                "call_id": id, "arguments": String(data: args, encoding: .utf8)!], 4)
+        }
+        func answer(_ id: String, index: Int = 0) -> Data {
+            let identity = try! JSONSerialization.data(withJSONObject: ["request_user_input_async", id, index])
+            let replies = try! JSONSerialization.data(withJSONObject: [["answer": "Yes", "questionItemId": String(data: identity, encoding: .utf8)!]])
+            let text = "<send_user_message_question_reply>\n" + String(data: replies, encoding: .utf8)! + "\n</send_user_message_question_reply>"
+            return line("response_item", ["type": "message", "role": "user", "content": [["type": "input_text", "text": text]]], 8)
+        }
+        let async = try file("async", event("task_started"))
+        let alerts = SessionStore()
+        _ = alerts.reconcile(CodexSource.merge([async], now: now), showDoneFor: nil)
+        try append(async, asyncQuestion("question", count: 2))
+        try append(async, line("response_item", ["type": "function_call_output", "call_id": "question", "output": "{\"accepted\":true}"], 5))
+        try append(async, line("response_item", ["type": "reasoning"], 6))
+        try append(async, line("response_item", ["type": "function_call_output", "call_id": "unrelated", "output": "ok"], 7))
+        check(async.state == .waiting, "Async question survives acknowledgement, reasoning, and unrelated tool output")
+        let asyncRows = alerts.reconcile(CodexSource.merge([async], now: now), showDoneFor: nil)
+        check(asyncRows.first?.phase == .waiting && alerts.inputRequiredKeys == ["codex:chat"],
+              "Async question reaches the waiting row and Bottle sound trigger")
+        try append(async, answer("other"))
+        check(async.state == .waiting, "Unrelated answer cannot clear a pending question")
+        try append(async, answer("question"))
+        check(async.state == .waiting, "Partially answered question batch remains waiting")
+        try append(async, answer("question", index: 1))
+        check(async.state == .working, "Answering all async questions resumes work")
+        try append(async, asyncQuestion("next", qualified: true))
+        try append(async, line("response_item", ["type": "message", "role": "assistant", "phase": "final_answer"], 9))
+        try append(async, event("task_complete", 10))
+        check(async.state == .waiting, "Unanswered async question stays visible after task completion")
+        check(RolloutFile(path: async.path).state == .waiting, "Reload reconstructs unanswered async questions")
+        try append(async, answer("next"))
+        check(async.state == .idle, "Answer after completion restores done state")
+        check(RolloutFile(path: async.path).state == .idle, "Reload agrees after async answers")
+        let mirror = try file("async-ui", event("task_started") + event("item_completed", 1, extra: ["item": [
+            "type": "AgentMessage", "delivery": "async", "id": "ui-question", "questions": [["title": "Choose"]]]]))
+        check(mirror.state == .waiting, "Async UI event recovers missing tool call")
+        try append(mirror, event("turn_aborted", 2))
+        check(mirror.state == .idle && mirror.interrupted, "Aborting clears pending async questions")
+
         let newer = try file("newer", event("task_started", 0, turn: "b"))
         try append(newer, event("task_complete", 1, turn: "a"))
         check(newer.state == .working, "Late completion from an old turn cannot stop the new one")
@@ -112,6 +154,44 @@ struct SessionTrackingTests {
         check(store.reconcile([raw(.working, "b", now)], showDoneFor: 300).first?.since == now,
               "Recovery preserves actual start time")
         check(store.reconcile([], showDoneFor: 300).isEmpty, "Closed sessions are removed")
+        for agent in Agent.allCases {
+            let sounds = SessionStore()
+            func soundRaw(_ state: RawState, interrupted: Bool = false) -> RawSession {
+                RawSession(key: agent.rawValue, agent: agent, info: info, state: state,
+                           finishedAt: Date(), interrupted: interrupted)
+            }
+            _ = sounds.reconcile([soundRaw(.idle)], showDoneFor: nil)
+            check(sounds.completedKeys.isEmpty, "\(agent): startup completions stay silent")
+            _ = sounds.reconcile([soundRaw(.working)], showDoneFor: nil)
+            _ = sounds.reconcile([soundRaw(.waiting)], showDoneFor: nil)
+            check(sounds.completedKeys.isEmpty, "\(agent): approval waits do not signal completion")
+            check(sounds.inputRequiredKeys == [agent.rawValue], "\(agent): entering a wait signals input required")
+            _ = sounds.reconcile([soundRaw(.waiting)], showDoneFor: nil)
+            check(sounds.inputRequiredKeys.isEmpty, "\(agent): ongoing waits do not repeat the sound")
+            _ = sounds.reconcile([soundRaw(.working)], showDoneFor: nil)
+            _ = sounds.reconcile([soundRaw(.waiting)], showDoneFor: nil)
+            check(sounds.inputRequiredKeys == [agent.rawValue], "\(agent): a later input request signals again")
+            _ = sounds.reconcile([soundRaw(.idle)], showDoneFor: 0)
+            check(sounds.completedKeys == [agent.rawValue], "\(agent): completion signals even with finished rows hidden")
+            _ = sounds.reconcile([soundRaw(.idle)], showDoneFor: nil)
+            check(sounds.completedKeys.isEmpty, "\(agent): refresh and visibility changes do not repeat completion")
+            sounds.dismissFinished()
+            _ = sounds.reconcile([soundRaw(.idle)], showDoneFor: nil)
+            check(sounds.completedKeys.isEmpty, "\(agent): dismissing a row does not repeat completion")
+            _ = sounds.reconcile([soundRaw(.working)], showDoneFor: nil)
+            _ = sounds.reconcile([soundRaw(.idle, interrupted: true)], showDoneFor: nil)
+            check(sounds.completedKeys.isEmpty, "\(agent): cancelled turns stay silent")
+            _ = sounds.reconcile([soundRaw(.working)], showDoneFor: nil)
+            _ = sounds.reconcile([soundRaw(.unknown)], showDoneFor: nil)
+            check(sounds.completedKeys.isEmpty, "\(agent): stale work stays silent")
+            _ = sounds.reconcile([soundRaw(.idle)], showDoneFor: nil)
+            check(sounds.completedKeys == [agent.rawValue], "\(agent): completion after unconfirmed state signals")
+            _ = sounds.reconcile([soundRaw(.working)], showDoneFor: nil)
+            _ = sounds.reconcile([], showDoneFor: nil)
+            check(sounds.completedKeys.isEmpty, "\(agent): closed sessions stay silent")
+            _ = sounds.reconcile([soundRaw(.waiting)], showDoneFor: nil)
+            check(sounds.inputRequiredKeys.isEmpty, "\(agent): existing waits loaded at startup stay silent")
+        }
         // Exercise Claude's actual registry/transcript reader, including refresh and PID reuse.
         let claudeHome = root.appendingPathComponent("claude")
         let registryDir = claudeHome.appendingPathComponent("sessions")

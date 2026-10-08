@@ -12,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var current: [Session] = []
+    private let completionSound = NSSound(named: NSSound.Name("Blow"))
+    private let inputRequiredSound = NSSound(named: NSSound.Name("Bottle"))
 
     private static let debug = CommandLine.arguments.contains("--debug")
 
@@ -35,7 +37,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     /// Effect toggles, stored as "effect.<name>" (all on by default).
     private static let effectNames: [(key: String, title: String, path: WritableKeyPath<Effects, Bool>)] = [
-        ("animatedLogos", "Animated Logos", \.animatedLogos),
         ("borderGlow", "Border Light", \.borderGlow),
         ("activityLine", "Activity Line", \.activityLine),
         ("activityTrace", "Activity Trace", \.activityTrace),
@@ -73,6 +74,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         get { flag("showTime", default: true) }
         set { defaults.set(newValue, forKey: "showTime") }
     }
+    private var playsCompletionSound: Bool {
+        get { flag("completionSound", default: true) }
+        set { defaults.set(newValue, forKey: "completionSound") }
+    }
+    private var playsInputRequiredSound: Bool {
+        get { flag("inputRequiredSound", default: true) }
+        set { defaults.set(newValue, forKey: "inputRequiredSound") }
+    }
     private var followDisplay: Bool {
         get { flag("followDisplay", default: true) }
         set { defaults.set(newValue, forKey: "followDisplay") }
@@ -83,7 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "circle.dotted.circle", accessibilityDescription: "Agent Indicator")
+        statusItem.button?.image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "Agent Indicator")?.withSymbolConfiguration(.init(pointSize: 16, weight: .medium))
         statusItem.button?.imagePosition = .imageLeading
         let menu = NSMenu()
         menu.delegate = self
@@ -131,6 +140,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if enabled(.claude) { raw += claude.sessions() }
         if enabled(.codex) { raw += codex.sessions(discover: fullCodexScan) }
         let sessions = store.reconcile(raw, showDoneFor: doneWindow)
+        if playsCompletionSound, !store.completedKeys.isEmpty {
+            // One chime per update when several chats finish together.
+            completionSound?.stop()
+            completionSound?.play()
+        }
+        if playsInputRequiredSound, !store.inputRequiredKeys.isEmpty {
+            inputRequiredSound?.stop()
+            inputRequiredSound?.play()
+        }
         if Self.debug {
             let line = sessions.map { "\($0.agent.rawValue):\($0.info.project):\($0.phase) [\($0.activity ?? "-") ·\($0.beats.count)]" }
                 .joined(separator: "  ")
@@ -269,6 +287,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(submenu("Show Finished", done))
 
         menu.addItem(toggle("Show Elapsed Time", showTime, #selector(toggleShowTime)))
+        menu.addItem(toggle("Completion Sound", playsCompletionSound, #selector(toggleCompletionSound)))
+        menu.addItem(toggle("Input Required Sound", playsInputRequiredSound, #selector(toggleInputRequiredSound)))
         menu.addItem(toggle("Show Floating List", showList, #selector(toggleShowList)))
 
         let agents = NSMenu()
@@ -352,6 +372,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleShowTime() {
         showTime.toggle()
         overlay.showsElapsedTime = showTime
+    }
+
+    @objc private func toggleCompletionSound() {
+        playsCompletionSound.toggle()
+    }
+    @objc private func toggleInputRequiredSound() {
+        playsInputRequiredSound.toggle()
     }
 
     @objc private func toggleShowList() {

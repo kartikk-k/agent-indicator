@@ -21,11 +21,13 @@ The menu bar icon mirrors the list: it shows how many chats are working and an o
 ## Features
 
 - **Real time.** File changes trigger updates with a 1.5-second recovery sweep for missed events and closed sessions.
+- **Status sounds.** Blow announces when a tracked Claude or Codex turn finishes; Bottle announces when a chat starts waiting for your input, even with the floating list hidden. Existing states loaded at startup and cancelled turns stay silent; chats reaching the same state in one update share one sound.
 - **Click to jump.** Clicking a row brings up that session:
   - Terminal.app and iTerm2 select the exact tab.
   - Codex desktop chats open directly with `codex://threads/<id>`.
   - Any other host app (Warp, Cursor, VS Code, Ghostty, the Claude app) is brought to the front.
 - **One row per chat.** A new message in the same chat reuses its row, and Codex subagent threads fold into their parent chat.
+- **Static agent icons.** The floating bar and menu share the installed apps' icons, with built-in fallbacks for terminal-only setups. Agent logos do not animate.
 - **Short labels.** Each row shows the project folder. When two chats share a folder, the first words of the chat title are added.
 - **Stays out of the way.** It floats above other windows on every Space, including full-screen apps, and never takes focus.
 - **Follows you across displays.** On a multi-monitor setup it moves to the display your pointer is on, or to the one holding the app you just switched to.
@@ -45,6 +47,8 @@ Everything lives in the menu bar icon:
 - **Show Finished**: how long finished chats stay (don't show, 1, 5 (default), 15 or 60 minutes, or while the session is open).
   - **Remove on Hover** (off by default): clear finished chats when the pointer leaves the list, or when you click them.
 - **Show Elapsed Time** (on by default): how long the current turn has been running. It counts every second for the first minute, then in minutes.
+- **Completion Sound** (on by default): play the macOS Blow sound when a tracked turn finishes.
+- **Input Required Sound** (on by default): play the macOS Bottle sound when a chat starts waiting for your input.
 - **Show Floating List** (on by default): turn off to keep status only in the menu bar.
 - **Agents**: turn Claude and Codex on or off.
 - **Launch at Login**.
@@ -85,6 +89,8 @@ Agent Indicator only reads files the agents already write locally.
 **Codex** (CLI and desktop app) appends turn events to `~/.codex/sessions/**/rollout-*.jsonl`: `task_started`, `task_complete`, `turn_aborted` and approval requests. A chat counts as open while a Codex process holds its rollout file open, which the app checks with `libproc`. Files are tailed incrementally. The latest main-thread turn event wins across continuation logs, and a final-channel answer also counts as completion. Partial writes are buffered; replaced or truncated files are reloaded. Chat titles come from `~/.codex/session_index.jsonl`.
 
 An open process or file is not proof of ongoing work. After 10 minutes without activity, a working session becomes **Status unconfirmed**, with no running timer or completion claim. New activity restores it automatically; explicit waits for user input remain waiting. Turn identities keep the elapsed time tied to the current turn even when an idle transition is missed.
+
+Codex async questions show **Needs your input · Shift+←** and trigger the Bottle sound. The question remains visible while Codex continues working, including after it finishes, until the matching answer arrives or the turn is aborted. An acknowledgement that the question was displayed does not count as an answer.
 
 Both folders are watched with file-level FSEvents and no coalescing delay. A 1.5-second sweep catches crashed processes and expires finished rows.
 

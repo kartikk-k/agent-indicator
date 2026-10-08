@@ -3,7 +3,6 @@ import QuartzCore
 
 /// Optional visual effects, each toggled from the menu. Read by every row and the list.
 struct Effects: Equatable {
-    var animatedLogos = true      // Claude's spark spins, Codex's mark breathes while working
     var borderGlow = true         // a light travels around the list's edge
     var activityLine = true       // "Editing Overlay.swift" under the label
     var activityTrace = true      // tiny heartbeat of recent tool calls
@@ -12,108 +11,18 @@ struct Effects: Equatable {
     static var current = Effects()
 }
 
-// MARK: - Logo that doubles as the loader
+// MARK: - Static agent logo
 
-/// Claude: a white spark on a clay tile, spinning slowly while working.
-/// Codex: the app icon, gently breathing while working.
-final class LogoView: NSView {
-    private let base = CALayer()
-    private let spark = CALayer()
-    private let agent: Agent
-
-    var animating = false { didSet { if animating != oldValue { update() } } }
-
+/// Uses the same agent artwork in the floating bar and menu.
+final class LogoView: NSImageView {
     init(agent: Agent) {
-        self.agent = agent
         super.init(frame: NSRect(x: 0, y: 0, width: 16, height: 16))
-        wantsLayer = true
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        switch agent {
-        case .claude:
-            base.backgroundColor = NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1).cgColor
-            base.cornerRadius = 4
-            spark.contents = Self.sparkImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
-            spark.contentsGravity = .resizeAspect
-            spark.contentsScale = scale
-            base.addSublayer(spark)
-        case .codex:
-            base.contents = AgentIcon.image(for: .codex).cgImage(forProposedRect: nil, context: nil, hints: nil)
-            base.contentsGravity = .resizeAspect
-            base.contentsScale = scale
-        }
-        layer?.addSublayer(base)
+        image = AgentIcon.image(for: agent)
+        imageScaling = .scaleProportionallyUpOrDown
+        setAccessibilityLabel(agent.displayName)
     }
 
     required init?(coder: NSCoder) { fatalError() }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        base.bounds = CGRect(origin: .zero, size: bounds.size)
-        base.position = CGPoint(x: bounds.midX, y: bounds.midY)
-        spark.bounds = CGRect(x: 0, y: 0, width: bounds.width - 2, height: bounds.height - 2)
-        spark.position = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
-        CATransaction.commit()
-    }
-
-    private func update() {
-        let target = agent == .claude ? spark : base
-        let key = "alive"
-        guard animating else {
-            // Ease back to rest from wherever the animation is, instead of snapping.
-            let current = target.presentation()?.transform ?? CATransform3DIdentity
-            target.removeAnimation(forKey: key)
-            let settle = CABasicAnimation(keyPath: "transform")
-            settle.fromValue = current
-            settle.toValue = CATransform3DIdentity
-            settle.duration = 0.35
-            settle.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            target.add(settle, forKey: "settle")
-            return
-        }
-        switch agent {
-        case .claude:
-            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-            spin.fromValue = 0
-            spin.toValue = -2 * Double.pi
-            spin.duration = 6
-            spin.repeatCount = .infinity
-            target.add(spin, forKey: key)
-        case .codex:
-            let breathe = CABasicAnimation(keyPath: "transform.scale")
-            breathe.fromValue = 1
-            breathe.toValue = 0.82
-            breathe.duration = 0.9
-            breathe.autoreverses = true
-            breathe.repeatCount = .infinity
-            breathe.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            target.add(breathe, forKey: key)
-        }
-    }
-
-    /// Claude's spark: twelve tapered rays of alternating length.
-    private static let sparkImage = NSImage(size: NSSize(width: 64, height: 64), flipped: false) { rect in
-        NSColor.white.setFill()
-        let c = NSPoint(x: rect.midX, y: rect.midY)
-        // Bold enough to read at 16 px: wide-based rays with rounded tips.
-        for i in 0..<12 {
-            let a = CGFloat(i) * .pi / 6 + 0.12
-            let len: CGFloat = i % 2 == 0 ? 29 : 22
-            let ray = NSBezierPath()
-            ray.move(to: NSPoint(x: c.x + cos(a + 0.3) * 8, y: c.y + sin(a + 0.3) * 8))
-            ray.line(to: NSPoint(x: c.x + cos(a) * len, y: c.y + sin(a) * len))
-            ray.line(to: NSPoint(x: c.x + cos(a - 0.3) * 8, y: c.y + sin(a - 0.3) * 8))
-            ray.close()
-            ray.lineWidth = 4
-            ray.lineJoinStyle = .round
-            NSColor.white.setStroke()
-            ray.stroke()
-            ray.fill()
-        }
-        NSBezierPath(ovalIn: NSRect(x: c.x - 9, y: c.y - 9, width: 18, height: 18)).fill()
-        return true
-    }
 }
 
 // MARK: - Activity trace
