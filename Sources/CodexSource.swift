@@ -43,6 +43,13 @@ final class CodexSource {
             for (path, pid) in open {
                 let f = files[path] ?? RolloutFile(path: path)
                 f.pid = pid
+                var process = proc_bsdinfo()
+                let processSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+                if proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &process, processSize) == processSize {
+                    f.ownerStartedAt = Date(timeIntervalSince1970: Double(process.pbi_start_tvsec))
+                } else {
+                    f.ownerStartedAt = nil
+                }
                 files[path] = f
             }
             for path in Array(files.keys) where open[path] == nil {
@@ -59,10 +66,11 @@ final class CodexSource {
     /// statuses. The newest main-thread lifecycle event wins, including completion.
     static func merge(_ files: [RolloutFile], threadNames: [String: String] = [:], now: Date = Date()) -> [RawSession] {
         let chats = Dictionary(grouping: files) { $0.sessionID ?? $0.path }
-        return chats.map { id, parts in
+        return chats.compactMap { id, parts in
             let mains = parts.filter { !$0.isSubagent }
-            let candidates = mains.isEmpty ? parts : mains
-            let main = candidates.max {
+            // A child rollout never represents the parent, even when the parent is closed.
+            guard !mains.isEmpty else { return nil }
+            let main = mains.max {
                 let a = $0.stateChangedAt ?? .distantPast, b = $1.stateChangedAt ?? .distantPast
                 return a == b ? $0.path < $1.path : a < b
             }!
@@ -71,7 +79,17 @@ final class CodexSource {
                 $0 === main || (main.turnID != nil && $0.turnID == main.turnID)
             }
             let evidence = currentParts.compactMap(\.lastEvidenceAt).max()
-            let state = SessionEvidence.state(main.state, lastActivity: evidence, now: now)
+            // Discovery establishes process ownership. Silence is normal during a long
+            // command/model request; an explicitly open turn has no wall-clock expiry.
+            let belongsToOwner = main.ownerStartedAt.map { (evidence ?? .distantPast) >= $0 } ?? true
+            let state: RawState
+            if !main.isReadable || (main.hasActiveTurn && !belongsToOwner) {
+                state = .unknown
+            } else if main.hasActiveTurn && main.pid != nil {
+                state = main.state
+            } else {
+                state = SessionEvidence.state(main.state, lastActivity: evidence, now: now)
+            }
             let latest = currentParts.max { ($0.activityAt ?? .distantPast) < ($1.activityAt ?? .distantPast) }
             let horizon = now.addingTimeInterval(-Activity.traceWindow)
             let beats = currentParts.flatMap(\.beats).filter { $0 > horizon }.sorted()
@@ -147,7 +165,13 @@ final class RolloutFile {
     private(set) var sessionID: String?
     private(set) var isSubagent = false
     var pid: pid_t?
-    private var reportedState: RawState = .idle
+    var ownerStartedAt: Date?
+    private(set) var isReadable = true
+    private var reportedState: RawState = .unknown
+    private var hasMetadata = false
+    private(set) var hasActiveTurn = false
+    private var seenQuestionCalls: Set<String> = []
+    private var blockingInputCall: String?
     /// Async questions remain actionable while the agent continues working or finishes.
     private var pendingQuestions: [String: Set<Int>] = [:]
     var hasPendingQuestions: Bool { !pendingQuestions.isEmpty }
@@ -177,39 +201,29 @@ final class RolloutFile {
 
     private func load() {
         title = "Codex"; sessionID = nil; isSubagent = false
-        pendingQuestions.removeAll()
-        state = .idle; finishedAt = nil; turnStartedAt = nil; turnID = nil
+        pendingQuestions.removeAll(); seenQuestionCalls.removeAll()
+        hasMetadata = false; hasActiveTurn = false; blockingInputCall = nil
+        state = .unknown; finishedAt = nil; turnStartedAt = nil; turnID = nil
         stateChangedAt = nil; lastEvidenceAt = nil; activity = nil; activityAt = nil
         beats.removeAll(); interrupted = false; offset = 0; partial.removeAll()
         let attrs = try? FileManager.default.attributesOfItem(atPath: path)
         fileIdentity = attrs?[.systemFileNumber] as? UInt64
         fileModifiedAt = attrs?[.modificationDate] as? Date
-        guard let h = FileHandle(forReadingAtPath: path) else { return }
+        guard let h = FileHandle(forReadingAtPath: path) else { isReadable = false; return }
+        isReadable = true
         defer { try? h.close() }
 
-        // Parse actual JSON so whitespace, escaping and nested metadata cannot change identity.
-        if let head = try? h.read(upToCount: 64 * 1024),
-           let line = head.split(separator: 0x0A).first,
-           let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-           obj["type"] as? String == "session_meta", let meta = obj["payload"] as? [String: Any] {
-            sessionID = meta["session_id"] as? String ?? meta["id"] as? String
-            isSubagent = meta["thread_source"] as? String == "subagent"
-                || (meta["source"] as? [String: Any])?["subagent"] != nil
-            if let cwd = meta["cwd"] as? String { title = URL(fileURLWithPath: cwd).lastPathComponent }
+        // Lifecycle and pending-input state cannot be reconstructed from an arbitrary
+        // tail: long CLI turns can span many megabytes. Stream from the beginning once,
+        // then consume only appended bytes. Memory is bounded by the largest JSON record.
+        do {
+            while let chunk = try h.read(upToCount: 256 * 1024), !chunk.isEmpty {
+                offset += UInt64(chunk.count)
+                consume(chunk)
+            }
+        } catch {
+            isReadable = false
         }
-
-        let size = (try? h.seekToEnd()) ?? 0
-        let start = size > 4_000_000 ? size - 4_000_000 : 0
-        try? h.seek(toOffset: start)
-        var tail = (try? h.readToEnd()) ?? Data()
-        offset = start + UInt64(tail.count)
-        if start > 0 {
-            if let nl = tail.firstIndex(of: 0x0A) { tail = Data(tail[(nl + 1)...]) }
-            else { tail.removeAll() }
-        }
-        consume(tail)
-        // A truncated history or a log mtime alone cannot prove that a task is running.
-        if stateChangedAt == nil, start > 0 || lastEvidenceAt != nil { state = .unknown }
     }
 
     func readNew() {
@@ -219,12 +233,18 @@ final class RolloutFile {
         let modifiedAt = attrs?[.modificationDate] as? Date
         if identity != fileIdentity || size < offset || (size == offset && modifiedAt != fileModifiedAt) { load(); return }
         fileModifiedAt = modifiedAt
-        guard size > offset, let h = FileHandle(forReadingAtPath: path) else { return }
+        guard size > offset else { return }
+        guard let h = FileHandle(forReadingAtPath: path) else { isReadable = false; return }
         defer { try? h.close() }
-        try? h.seek(toOffset: offset)
-        guard let chunk = try? h.readToEnd() else { return }
-        offset += UInt64(chunk.count)
-        consume(chunk)
+        do {
+            try h.seek(toOffset: offset)
+            guard let chunk = try h.readToEnd() else { return }
+            isReadable = true
+            offset += UInt64(chunk.count)
+            consume(chunk)
+        } catch {
+            isReadable = false
+        }
     }
 
     private func consume(_ chunk: Data) {
@@ -235,21 +255,9 @@ final class RolloutFile {
         for line in complete.split(separator: 0x0A) { apply(Data(line)) }
     }
 
-    /// Returns true if the line was a turn-level event that set the state.
-    private static let activityMarkers = ["\"function_call\"", "\"custom_tool_call\"", "\"local_shell_call\"",
-                                          "\"reasoning\"", "\"message\"", "\"web_search_call\""].map { Data($0.utf8) }
-
-    /// Tool calls, reasoning and replies → the "doing now" line and the activity trace.
-    private func noteActivity(_ line: Data) {
-        // The payload type sits near the start of the line; check it before parsing big lines.
-        let head = line.prefix(400)
-        guard head.range(of: Data("response_item".utf8)) != nil,
-              Self.activityMarkers.contains(where: { head.range(of: $0) != nil }),
-              line.count < 4_000_000,
-              let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              let payload = obj["payload"] as? [String: Any], let type = payload["type"] as? String else { return }
-        guard let date = EventDate.parse(obj["timestamp"] as? String) else { return }
-
+    /// Tool calls, reasoning and replies → the activity line. Reuse the parsed record.
+    private func noteActivity(_ payload: [String: Any], type: String, date: Date?) {
+        guard let date else { return }
         switch type {
         case "function_call", "custom_tool_call", "local_shell_call":
             let name = payload["name"] as? String ?? "shell"
@@ -275,7 +283,7 @@ final class RolloutFile {
     private func registerQuestions(_ payload: [String: Any], id: String?) {
         guard let id, let questions = payload["questions"] as? [[String: Any]], !questions.isEmpty else { return }
         // The tool call and its UI event describe the same question batch.
-        if pendingQuestions[id] == nil { pendingQuestions[id] = Set(questions.indices) }
+        if seenQuestionCalls.insert(id).inserted { pendingQuestions[id] = Set(questions.indices) }
     }
 
     private func answerQuestions(_ content: Any?) -> Bool {
@@ -303,9 +311,26 @@ final class RolloutFile {
         return changed
     }
 
+    private func receiveUserMessage(_ content: Any?) -> Bool {
+        guard let parts = content as? [[String: Any]] else { return false }
+        let texts = parts.compactMap { $0["text"] as? String }
+        // Structured replies clear only their matching questions, including partial answers.
+        if texts.contains(where: { $0.contains("<send_user_message_question_reply>") }) {
+            return answerQuestions(content)
+        }
+        // A direct answer or a new user instruction supersedes the old question. A
+        // task_started event alone may be automatic continuation, not a user response.
+        let hasUserText = texts.contains {
+            let text = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !text.isEmpty && !text.hasPrefix("<environment_context>")
+        }
+        guard hasUserText, !pendingQuestions.isEmpty else { return false }
+        pendingQuestions.removeAll()
+        return true
+    }
+
     @discardableResult
     private func apply(_ line: Data) -> Bool {
-        noteActivity(line)
         // Completion events may include a very large final answer. Never discard them
         // because of the answer's length (the old 512 KB cap left turns working forever).
         guard line.range(of: Self.marker) != nil || line.range(of: Data("response_item".utf8)) != nil
@@ -313,6 +338,10 @@ final class RolloutFile {
               let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               let payload = obj["payload"] as? [String: Any] else { return false }
         if obj["type"] as? String == "session_meta" {
+            // Forked CLI histories repeat the parent's metadata. Only the first header
+            // describes this file's identity and whether it is a subagent.
+            guard !hasMetadata else { return false }
+            hasMetadata = true
             sessionID = payload["session_id"] as? String ?? payload["id"] as? String
             isSubagent = payload["thread_source"] as? String == "subagent"
                 || (payload["source"] as? [String: Any])?["subagent"] != nil
@@ -322,9 +351,12 @@ final class RolloutFile {
         guard let type = payload["type"] as? String else { return false }
         let date = EventDate.parse(obj["timestamp"] as? String)
         let eventTurn = payload["turn_id"] as? String
+            ?? (payload["internal_chat_message_metadata_passthrough"] as? [String: Any])?["turn_id"] as? String
         let matchesTurn = eventTurn == nil || turnID == nil || eventTurn == turnID
 
         if obj["type"] as? String == "response_item" {
+            guard matchesTurn else { return false }
+            noteActivity(payload, type: type, date: date)
             if type == "function_call",
                (payload["name"] as? String)?.split(separator: ".").last == "request_user_input_async" {
                 if let arguments = payload["arguments"] as? String,
@@ -335,16 +367,26 @@ final class RolloutFile {
                 return true
             }
             if type == "message", payload["role"] as? String == "user",
-               answerQuestions(payload["content"]) {
+               receiveUserMessage(payload["content"]) {
+                stateChangedAt = date; lastEvidenceAt = date
+                return true
+            }
+            if type == "function_call_output", let call = payload["call_id"] as? String,
+               pendingQuestions[call] != nil, let output = payload["output"] as? String,
+               let result = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
+               result["accepted"] as? Bool == false || result["isError"] as? Bool == true {
+                pendingQuestions[call] = nil
                 stateChangedAt = date; lastEvidenceAt = date
                 return true
             }
             if type == "function_call", ["request_user_input", "functions.request_user_input"].contains(payload["name"] as? String ?? "") {
+                blockingInputCall = payload["call_id"] as? String
                 state = .waiting; stateChangedAt = date; lastEvidenceAt = date
                 return true
             }
-            // A final-channel response is explicit completion evidence, unlike commentary.
-            if type == "message", payload["role"] as? String == "assistant",
+            // An explicit task lifecycle is authoritative. A final answer can precede
+            // continuing work; it is only a fallback for logs without an active start.
+            if !hasActiveTurn, type == "message", payload["role"] as? String == "assistant",
                ["final", "final_answer"].contains(payload["phase"] as? String ?? "") {
                 state = .idle; interrupted = false; finishedAt = date
                 stateChangedAt = date; lastEvidenceAt = date
@@ -355,35 +397,48 @@ final class RolloutFile {
                 || (type == "message" && payload["role"] as? String == "assistant")
             if progress {
                 lastEvidenceAt = date
-                if reportedState == .waiting { state = .working }
-                if state == .unknown { state = .working }
+                let matchingInputResult = type == "function_call_output"
+                    && blockingInputCall != nil && payload["call_id"] as? String == blockingInputCall
+                if reportedState == .waiting, blockingInputCall == nil || matchingInputResult {
+                    state = .working; blockingInputCall = nil; stateChangedAt = date
+                }
+                if reportedState == .unknown { state = .working; stateChangedAt = date }
             }
             return false
         }
         guard obj["type"] as? String == "event_msg" else { return false }
         switch type {
+        case "user_message":
+            guard matchesTurn, let message = payload["message"] as? String,
+                  receiveUserMessage([["text": message]]) else { return false }
         case "item_completed":
             guard matchesTurn, let item = payload["item"] as? [String: Any] else { return false }
             if item["type"] as? String == "AgentMessage", item["delivery"] as? String == "async" {
                 registerQuestions(item, id: item["id"] as? String)
             } else if item["type"] as? String == "UserMessage" {
-                guard answerQuestions(item["content"]) else { return false }
+                guard receiveUserMessage(item["content"]) else { return false }
             } else {
                 lastEvidenceAt = date
                 return false
             }
         case "task_started", "turn_started":
             // Duplicate starts must not reset a running turn's clock.
-            if eventTurn == nil || eventTurn != turnID { turnStartedAt = date }
+            if eventTurn == nil || eventTurn != turnID {
+                turnStartedAt = date
+                blockingInputCall = nil
+            }
+            hasActiveTurn = true
             turnID = eventTurn ?? date.map { String($0.timeIntervalSince1970) }
             state = .working; interrupted = false; finishedAt = nil
             activity = nil; activityAt = nil; beats.removeAll()
         case "task_complete", "turn_complete":
             guard matchesTurn else { return false }
+            hasActiveTurn = false; blockingInputCall = nil
             turnID = turnID ?? eventTurn
             state = .idle; interrupted = false; finishedAt = date
         case "turn_aborted":
             guard matchesTurn else { return false }
+            hasActiveTurn = false; blockingInputCall = nil
             pendingQuestions.removeAll()
             turnID = turnID ?? eventTurn
             state = .idle; interrupted = true; finishedAt = nil

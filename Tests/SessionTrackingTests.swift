@@ -47,6 +47,30 @@ struct SessionTrackingTests {
         check(SessionEvidence.state(.waiting, lastActivity: now.addingTimeInterval(-180000), now: now) == .waiting,
               "Long explicit user waits do not expire")
 
+        // CLI subagent rollouts contain copied parent metadata and history after their own header.
+        let childMeta = line("session_meta", ["id": "child", "session_id": "chat", "thread_source": "subagent"])
+        let childPath = root.appendingPathComponent("inherited-child")
+        try (childMeta + meta + event("task_started", -20) + event("task_complete", -1)).write(to: childPath)
+        let child = RolloutFile(path: childPath.path)
+        check(child.isSubagent, "Copied parent metadata cannot turn a subagent into a main chat")
+        let parent = try file("active-parent", event("task_started", -30))
+        check(CodexSource.merge([parent, child], now: now).first?.state == .working,
+              "A completed subagent cannot finish its working parent")
+        check(CodexSource.merge([child], now: now).isEmpty, "Orphan subagents cannot impersonate completed parent chats")
+        let long = try file("long-turn", event("task_started", -3600) + line("response_item", [
+            "type": "function_call_output", "output": String(repeating: "x", count: 4_100_000)], -1))
+        long.pid = getpid()
+        check(long.turnStartedAt == now.addingTimeInterval(-3600), "Large logs retain the start and clock of a long turn")
+        check(CodexSource.merge([long], now: now.addingTimeInterval(7200)).first?.state == .working,
+              "An explicit active turn owned by a live process does not time out")
+
+        long.ownerStartedAt = now.addingTimeInterval(1)
+        check(CodexSource.merge([long], now: now.addingTimeInterval(7200)).first?.state == .unknown,
+              "A newly restarted CLI process cannot resurrect an abandoned old turn")
+        let missing = RolloutFile(path: root.appendingPathComponent("missing-log").path)
+        check(CodexSource.merge([missing], now: now).first?.state == .unknown,
+              "An unreadable log is unconfirmed, never completed")
+
         let old = try file("old", event("task_started", -180000))
         let done = try file("new", event("task_started", -30) + event("task_complete", -10))
         check(CodexSource.merge([old, done], now: now).first?.state == .idle,
@@ -69,7 +93,11 @@ struct SessionTrackingTests {
         try append(final, line("response_item", ["type": "message", "role": "assistant", "phase": "commentary"], 1))
         check(final.state == .working, "Commentary does not finish a turn")
         try append(final, line("response_item", ["type": "message", "role": "assistant", "phase": "final_answer"], 2))
-        check(final.state == .idle, "Final answer recovers missing task_complete")
+        check(final.state == .working, "A final response cannot finish an explicitly active turn")
+        try append(final, event("task_complete", 3))
+        check(final.state == .idle, "Explicit completion finishes the active turn")
+        let legacyFinal = try file("legacy-final", line("response_item", ["type": "message", "role": "assistant", "phase": "final_answer"], 2))
+        check(legacyFinal.state == .idle, "Final response remains a fallback without an active lifecycle")
 
         let waiting = try file("waiting", event("task_started") + event("request_user_input", 1))
         try append(waiting, event("token_count", 2))
@@ -118,6 +146,32 @@ struct SessionTrackingTests {
         try append(mirror, event("turn_aborted", 2))
         check(mirror.state == .idle && mirror.interrupted, "Aborting clears pending async questions")
 
+        let superseded = try file("superseded-question", event("task_started") + asyncQuestion("old-question") + event("task_complete", 5))
+        check(superseded.state == .waiting, "An unanswered question remains visible after its task completes")
+        try append(superseded, event("task_started", 6, turn: "new-task"))
+        check(superseded.state == .waiting, "Automatic continuation alone cannot discard an unanswered question")
+        try append(superseded, line("response_item", ["type": "message", "role": "user", "content": [["type": "input_text", "text": "Continue with this new task"]]], 7))
+        check(superseded.state == .working && !superseded.hasPendingQuestions,
+              "A new user task supersedes an unanswered old question")
+        let blocking = try file("blocking-question", event("task_started") + line("response_item", [
+            "type": "function_call", "name": "request_user_input", "call_id": "blocking"], 1))
+        try append(blocking, line("response_item", ["type": "function_call_output", "call_id": "other", "output": "ok"], 2))
+        check(blocking.state == .waiting, "An unrelated tool output cannot clear a blocking CLI question")
+        try append(blocking, line("response_item", ["type": "function_call_output", "call_id": "blocking", "output": "{\"answers\":{}}"], 3))
+        check(blocking.state == .working, "The matching CLI question result resumes work")
+        let scoped = try file("scoped-final", event("task_started", 0, turn: "new-task") + line("response_item", [
+            "type": "message", "role": "assistant", "phase": "final_answer",
+            "internal_chat_message_metadata_passthrough": ["turn_id": "old-task"]], 2))
+        check(scoped.state == .working, "An old turn's final response cannot finish current work")
+
+        let rejected = try file("rejected-question", event("task_started") + asyncQuestion("rejected"))
+        try append(rejected, line("response_item", ["type": "function_call_output", "call_id": "rejected", "output": "{\"accepted\":false}"], 5))
+        check(rejected.state == .working, "An async question that was not accepted cannot leave a stuck wait")
+        let duplicate = try file("duplicate-question", event("task_started") + asyncQuestion("duplicate") + answer("duplicate"))
+        try append(duplicate, event("item_completed", 9, extra: ["item": ["type": "AgentMessage", "delivery": "async", "id": "duplicate", "questions": [["title": "Choose"]]]]))
+        check(duplicate.state == .working, "A delayed duplicate UI question cannot resurrect an answered prompt")
+        check(RolloutFile(path: duplicate.path).state == .working, "Answered prompt remains cleared after a full reload")
+
         let newer = try file("newer", event("task_started", 0, turn: "b"))
         try append(newer, event("task_complete", 1, turn: "a"))
         check(newer.state == .working, "Late completion from an old turn cannot stop the new one")
@@ -129,11 +183,11 @@ struct SessionTrackingTests {
         let replaced = try file("replace", event("task_started"))
         try meta.write(to: URL(fileURLWithPath: replaced.path), options: .atomic)
         replaced.readNew()
-        check(replaced.state == .idle && replaced.turnStartedAt == nil, "Replacing a log clears old state")
+        check(replaced.state == .unknown && replaced.turnStartedAt == nil, "Replacing a log clears old state")
         let truncated = try file("truncate", event("task_started"))
         let h = try FileHandle(forWritingTo: URL(fileURLWithPath: truncated.path))
         try h.truncate(atOffset: UInt64(meta.count)); try h.close(); truncated.readNew()
-        check(truncated.state == .idle && truncated.turnStartedAt == nil, "Truncating a log clears old state")
+        check(truncated.state == .unknown && truncated.turnStartedAt == nil, "Truncating a log clears old state")
         check(CodexSource.merge([old], now: now).first?.state == .unknown, "Orphan start is unconfirmed after restart")
         try append(old, line("response_item", ["type": "reasoning"], 0))
         check(CodexSource.merge([old], now: now).first?.state == .working, "Fresh evidence restores a quiet turn")
